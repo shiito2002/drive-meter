@@ -10,32 +10,39 @@
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div id="reviewBar"><span id="reviewName"></span><button id="btnExitReview">✕ 戻る</button></div>
+
 <div id="app" class="app landscape">
   <section class="meter">
     <div class="topbar">
       <span id="gps" class="gps">GPS オフ</span>
       <span class="spacer"></span>
+      <button id="btnRecords" class="icon" aria-label="記録">📁</button>
       <button id="btnRec" class="icon" aria-label="記録開始">▶</button>
       <button id="btnSettings" class="icon" aria-label="設定">⚙</button>
     </div>
+    <!-- 左半分をタップで設定速度 −10、右半分で +10 -->
     <div id="speedbox" class="speedbox">
       <div class="speed"><span id="speed">--</span><small>km/h</small></div>
-      <div id="delta" class="delta"></div>
+      <div class="delta">設定 <b id="dTarget">60</b> ±<span id="dTol">10</span> km/h<span id="dDiff"></span></div>
+      <div id="toast" class="toast"></div>
     </div>
     <div class="barwrap">
       <div class="bar">
         <div id="band" class="band"></div>
         <div id="fill" class="fill"></div>
-        <div id="tgt" class="tgt"></div>
+        <div class="center"></div>
+        <div id="ovL" class="over l">◀</div>
+        <div id="ovR" class="over r">▶</div>
       </div>
-      <div class="barlbl"><span>0</span><span id="lblMax">120</span></div>
+      <div id="barLbl" class="barlbl"></div>
     </div>
     <div class="stats">
       <div class="stat"><span>最高速度</span><b id="sMax">--</b></div>
       <div class="stat"><span>平均（走行中）</span><b id="sAvg">--</b></div>
       <div class="stat"><span>走行距離</span><b id="sDist">--</b></div>
       <div class="stat"><span>記録時間</span><b id="sTime">--</b></div>
-      <div class="stat"><span>現在高度</span><b id="sAlt">--</b></div>
+      <div class="stat"><span id="sAltLbl">現在高度</span><b id="sAlt">--</b></div>
       <div class="stat"><span>累積上昇</span><b id="sGain">--</b></div>
     </div>
   </section>
@@ -44,18 +51,53 @@
     <canvas id="cRecent"></canvas>
   </section>
   <section class="chart all">
-    <div class="ttl">ドライブ全体</div>
+    <div class="ttl" id="allTtl">ドライブ全体</div>
     <canvas id="cAll"></canvas>
   </section>
 </div>
 
+<!-- 記録一覧 -->
+<dialog id="records" class="full">
+  <div class="rec">
+    <header><button id="btnCloseRecords" class="icon" aria-label="閉じる">←</button><h2>ドライブ記録</h2></header>
+    <div id="recCur" class="cur">
+      <div class="t" id="recCurState">● 記録中のドライブ</div>
+      <div class="s" id="recCurStats"></div>
+      <div class="note" id="recCurSaved"></div>
+      <button id="btnSaveCur" class="btn pri">名前を付けて保存</button>
+    </div>
+    <div id="recList" class="items"></div>
+    <div class="foot">
+      <button id="btnImport" class="btn">ファイルから読み込む</button>
+      <button id="btnExportAll" class="btn">すべて書き出し</button>
+    </div>
+  </div>
+  <input id="fileIn" type="file" accept=".json,application/json" hidden>
+</dialog>
+
+<!-- 名前の入力（保存・名前変更） -->
+<dialog id="nameDlg">
+  <form method="dialog" class="dlg">
+    <h3 id="nameTitle">名前を付けて保存</h3>
+    <label for="nameIn">名前</label>
+    <input id="nameIn" type="text" maxlength="40" autocomplete="off">
+    <p id="nameInfo" class="info"></p>
+    <label id="nameNewRow" class="chk"><input id="nameNew" type="checkbox"> 保存後に新しいドライブを開始する</label>
+    <div class="bt">
+      <button type="button" id="nameCancel" class="btn">キャンセル</button>
+      <button value="ok" class="btn pri">OK</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 設定 -->
 <dialog id="settings">
   <form method="dialog" class="set">
     <h2>設定</h2>
 
     <div class="field">
-      <label for="fTarget">設定速度</label>
-      <div class="num"><input id="fTarget" type="number" inputmode="numeric" min="5" max="200" step="5"><span>km/h</span></div>
+      <label for="fTarget">設定速度（速度表示の左側タップで −10、右側タップで ＋10）</label>
+      <div class="num"><input id="fTarget" type="number" inputmode="numeric" min="10" max="200" step="5"><span>km/h</span></div>
       <div class="chips" data-for="fTarget" data-values="30,40,50,60,70,80,100"></div>
     </div>
 
@@ -63,6 +105,12 @@
       <label for="fTol">許容幅（この差を超えると 超過＝赤／低下＝青 で表示）</label>
       <div class="num"><span>±</span><input id="fTol" type="number" inputmode="numeric" min="1" max="50" step="1"><span>km/h</span></div>
       <div class="chips" data-for="fTol" data-values="5,10,15,20"></div>
+    </div>
+
+    <div class="field">
+      <label for="fBar">速度バーの表示範囲（設定速度の前後）</label>
+      <div class="num"><span>±</span><input id="fBar" type="number" inputmode="numeric" min="5" max="100" step="5"><span>km/h</span></div>
+      <div class="chips" data-for="fBar" data-values="10,20,30,40"></div>
     </div>
 
     <div class="field">
