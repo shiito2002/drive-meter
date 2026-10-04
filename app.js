@@ -55,6 +55,7 @@ const ymd = ts => { const d = new Date(ts); return `${d.getFullYear()}/${d.getMo
 const esc = s => String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 const fmtTime = s => `${Math.floor(s / 3600)}:${p2(Math.floor(s / 60) % 60)}`;
 const fmtDist = km => km < 100 ? km.toFixed(1) : String(Math.round(km));
+const fmtMS = s => `${Math.floor(s / 60)}:${p2(Math.floor(s % 60))}`;
 const winLabel = sec => sec < 60 ? `${Math.round(sec)}秒` : `${+(sec / 60).toFixed(1)}分`;
 
 function hav(lat1, lng1, lat2, lng2) {
@@ -96,6 +97,7 @@ function onPosition(pos) {
   liveV = v;
   updateWarn(v);
   if (c.accuracy <= MAX_ACC) maybeQueryMuni(c.latitude, c.longitude, v);
+  if (!pos.demo) imuOnGps(t, v, c.accuracy);
 
   if (!rec || c.accuracy > MAX_ACC || (n && dt <= 0)) { requestRender(); return; }
 
@@ -261,6 +263,104 @@ function demAt(lat, lng) {
   if (!(tile instanceof Float32Array) || isNaN(tile[t.i])) return undefined;
   return tile[t.i];
 }
+// ===================== トンネル内の速度推定（加速度センサー） =====================
+// GPSが良い間に「端末の加速度ベクトル → 車の前後加速度」の対応を学習しておき
+// （前後加速度 ≒ f·a + c、f と c を最小二乗で推定）、GPSが途切れたら最後の速度から積分して推定する。
+// 時間とともに誤差がたまる（目安：30秒で±5km/h、1分で±10km/h）ので、推定中は灰色で表示する。
+const IMU = {
+  R: new Float64Array(16), b: new Float64Array(4),   // 正規方程式（古いデータは少しずつ忘れる）
+  f: null, n: 0,                // 学習結果 [fx, fy, fz, c] / 加減速のあった学習回数
+  sum: [0, 0, 0], cnt: 0,       // GPS更新の間の平均加速度
+  lastT: 0, prevGps: null,      // 前回のセンサー時刻 / 前回のGPS { t, v[m/s] }
+  lp: [0, 0, 0], vib: 0, vibStop: null, vibMove: null, still: 0,   // 細かい振動の大きさ（停車判定用）
+  est: null,                    // 推定中 { v[m/s], since[ms] }
+  events: 0,
+};
+const IMU_MIN_N = 15;           // 加減速がこの回数あれば学習完了
+
+addEventListener('devicemotion', e => {
+  const a = e.acceleration;     // 重力を除いた加速度（端末の座標系）
+  if (!a || a.x == null) return;
+  const now = performance.now(), dt = IMU.lastT ? Math.min(0.2, (now - IMU.lastT) / 1000) : 0;
+  IMU.lastT = now; IMU.events++;
+  imuSample(a.x, a.y, a.z, dt);
+});
+
+function imuSample(x, y, z, dt) {
+  IMU.sum[0] += x; IMU.sum[1] += y; IMU.sum[2] += z; IMU.cnt++;
+  // 細かい振動だけを見る（0.3秒より遅い加減速は除く）→ 約1秒の二乗平均
+  const k = Math.min(1, dt / 0.3), lp = IMU.lp;
+  lp[0] += (x - lp[0]) * k; lp[1] += (y - lp[1]) * k; lp[2] += (z - lp[2]) * k;
+  const hx = x - lp[0], hy = y - lp[1], hz = z - lp[2];
+  IMU.vib += (hx * hx + hy * hy + hz * hz - IMU.vib) * Math.min(1, dt);
+  const E = IMU.est;
+  if (!E || dt <= 0) return;
+  if (IMU.f) {
+    const f = IMU.f;
+    E.v = Math.min(70, Math.max(0, E.v + (f[0] * x + f[1] * y + f[2] * z + f[3]) * dt));
+  }
+  // 振動がほとんどない状態が2秒続いたら停車とみなす（停車中と走行中の振動を学習済みのときだけ）
+  if (IMU.vibStop != null && IMU.vibMove != null && IMU.vibMove > IMU.vibStop * 3) {
+    const thr = Math.sqrt(IMU.vibStop * IMU.vibMove);
+    IMU.still = IMU.vib < thr ? IMU.still + dt : 0;
+    if (IMU.still > (E.v < 7 ? 2 : 5)) E.v = 0;          // 推定がまだ速いときは慎重に（5秒）
+  }
+}
+
+// GPSを受信するたび：推定を終了し、精度の良い点で学習する
+function imuOnGps(t, vKmh, acc) {
+  IMU.est = null;
+  const v = vKmh / 3.6, p = IMU.prevGps;
+  if (acc <= 20 && IMU.cnt > 10 && p && t - p.t >= 500 && t - p.t <= 2500 && (v > 1.5 || p.v > 1.5)) {
+    const ag = (v - p.v) / ((t - p.t) / 1000);                       // GPSから求めた前後加速度
+    const m = [IMU.sum[0] / IMU.cnt, IMU.sum[1] / IMU.cnt, IMU.sum[2] / IMU.cnt, 1];
+    const L = 0.995;
+    for (let i = 0; i < 4; i++) {
+      IMU.b[i] = L * IMU.b[i] + m[i] * ag;
+      for (let j = 0; j < 4; j++) IMU.R[i * 4 + j] = L * IMU.R[i * 4 + j] + m[i] * m[j];
+    }
+    if (Math.abs(ag) > 0.3) IMU.n++;
+    if (IMU.n >= IMU_MIN_N) {
+      const f = solve4(IMU.R, IMU.b);
+      const len = f && Math.hypot(f[0], f[1], f[2]);
+      if (f && len > 0.5 && len < 1.6) IMU.f = f;                      // 向きの大きさが1前後なら採用
+    }
+  }
+  if (acc <= 20 && IMU.cnt) {
+    const vib = IMU.vib;
+    if (v < 0.3 && p && p.v < 0.3) IMU.vibStop = IMU.vibStop == null ? vib : IMU.vibStop + (vib - IMU.vibStop) * 0.05;
+    if (v > 8) IMU.vibMove = IMU.vibMove == null ? vib : IMU.vibMove + (vib - IMU.vibMove) * 0.05;
+  }
+  IMU.sum = [0, 0, 0]; IMU.cnt = 0;
+  if (acc <= MAX_ACC) IMU.prevGps = { t, v };
+}
+
+// 走行中にGPSが2.5秒以上途切れたら推定を始める
+function imuMaybeStart() {
+  if (IMU.est || demo || watchId == null || !IMU.prevGps || !IMU.lastT) return;
+  const lost = Date.now() - lastFix;
+  if (lost > 2500 && IMU.prevGps.v * 3.6 >= STOP_KMH && performance.now() - IMU.lastT < 1000) {
+    IMU.est = { v: IMU.prevGps.v, since: lastFix };
+    IMU.still = 0;
+  }
+}
+
+function solve4(R, b) {     // (R + εI) f = b をガウスの消去法で解く
+  const A = [];
+  for (let i = 0; i < 4; i++) { A.push([...R.slice(i * 4, i * 4 + 4), b[i]]); A[i][i] += 1e-4; }
+  for (let c = 0; c < 4; c++) {
+    let piv = c;
+    for (let r = c + 1; r < 4; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
+    if (Math.abs(A[piv][c]) < 1e-12) return null;
+    [A[c], A[piv]] = [A[piv], A[c]];
+    for (let r = 0; r < 4; r++) if (r !== c) {
+      const k = A[r][c] / A[c][c];
+      for (let j = c; j < 5; j++) A[r][j] -= k * A[c][j];
+    }
+  }
+  return A.map((row, i) => row[4] / row[i]);
+}
+
 function recomputeGain(d) {
   let ref = null;
   d.gain = 0; d.loss = 0;
@@ -282,6 +382,7 @@ function updateGpsStatus() {
   }
   else if (!demo && watchId == null) txt = 'GPS オフ';
   else if (!lastFix) txt = 'GPS 測位中…';
+  else if (IMU.est) { cls = 'est'; txt = 'GPSなし・加速度で推定中'; }
   else if (Date.now() - lastFix > 5000) { cls = 'bad'; txt = 'GPS 受信なし'; }
   else {
     // 位置の精度（＋取れれば高度の精度）
@@ -292,8 +393,10 @@ function updateGpsStatus() {
   el.className = 'gps ' + cls; el.textContent = txt;
 }
 setInterval(() => {
+  imuMaybeStart();
   updateGpsStatus();
   if (liveV != null && Date.now() - lastFix > 5000) { liveV = null; warn = null; requestRender(); }
+  if (IMU.est) requestRender();
 }, 1000);
 
 // ===================== 警告・色 =====================
@@ -753,15 +856,19 @@ function render() {
   const ci = view ? view.ci : R.V.length - 1;
 
   // --- 速度表示 ---
-  const v = view ? R.V[ci] : liveV;
-  const w = view ? warnOf(v) : warn;
+  const est = !view && IMU.est ? IMU.est.v * 3.6 : null;   // トンネル内などの推定値
+  const v = view ? R.V[ci] : est != null ? est : liveV;
+  const w = view ? warnOf(v) : est != null ? null : warn;
   $('speed').textContent = v == null ? '--' : Math.round(v);
   updateGpsStatus();
+  $('speedbox').classList.toggle('estimating', est != null);
   $('speedbox').classList.toggle('warn-fast', w === 'fast' && v != null);
   $('speedbox').classList.toggle('warn-slow', w === 'slow' && v != null);
   $('dTarget').textContent = S.target;
   $('dTol').textContent = S.tol;
-  $('dDiff').textContent = v == null ? '' : `　差 ${v - S.target >= 0 ? '+' : ''}${Math.round(v - S.target)}`;
+  $('dDiff').textContent = v == null ? ''
+    : est != null ? `　推定 ${fmtMS((Date.now() - IMU.est.since) / 1000)}${IMU.f ? '' : '（学習前のため速度を保持）'}`
+    : `　差 ${v - S.target >= 0 ? '+' : ''}${Math.round(v - S.target)}`;
 
   // --- 速度バー（設定速度 ± barHalf の範囲を拡大） ---
   const lo = S.target - S.barHalf, span = S.barHalf * 2, hi = lo + span;
@@ -772,7 +879,7 @@ function render() {
     const pv = P(v);
     fill.style.left = Math.min(50, pv) + '%';
     fill.style.width = Math.abs(pv - 50) + '%';
-    fill.style.background = colorFor(v);
+    fill.style.background = est != null ? '#8a94a8' : colorFor(v);
     fill.style.borderRadius = pv < 50 ? '8px 0 0 8px' : '0 8px 8px 0';
   }
   $('band').style.left = P(S.target - S.tol) + '%';
@@ -1044,7 +1151,9 @@ function syncForm() {
     ch.querySelectorAll('button').forEach(b => b.classList.toggle('sel', +b.textContent === v));
   });
   $('btnDemo').textContent = demo ? 'デモ走行を終了' : 'デモ走行を開始';
-  $('info').textContent = `記録点数 ${D.V.length}　/　データ量 約${Math.round(JSON.stringify(D).length / 1024)}KB`;
+  const imu = !IMU.events ? '加速度センサー：未検出' : IMU.f ? '加速度センサー：学習済み（トンネル内で推定可）'
+    : `加速度センサー：学習中 ${Math.min(IMU.n, IMU_MIN_N)}/${IMU_MIN_N}（加速・減速するたびに進みます）`;
+  $('info').textContent = `記録点数 ${D.V.length}　/　データ量 約${Math.round(JSON.stringify(D).length / 1024)}KB　/　${imu}`;
 }
 function onField(id) {
   const key = FIELDS[id], v = parseFloat($(id).value);

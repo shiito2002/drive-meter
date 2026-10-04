@@ -28,6 +28,7 @@ body.reviewing #btnRec,body.reviewing #btnRecords{display:none}
 .gps.fair{background:#fbbf2422;color:var(--gold)}
 .gps.bad{background:#ef444422;color:var(--red)}
 .gps.demo,.gps.view{background:#a78bfa22;color:var(--alt)}
+.gps.est{background:#8a94a833;color:#cbd5e1}
 .icon{width:44px;height:44px;flex:none;border-radius:12px;border:1px solid var(--line);background:var(--panel);font-size:20px;line-height:1}
 .icon.on{background:var(--red);border-color:var(--red);color:#fff}
 
@@ -38,6 +39,8 @@ body.reviewing #btnRec,body.reviewing #btnRecords{display:none}
 @keyframes blink-b{50%{background:#3b82f605}}
 .speed{font-weight:800;line-height:1;font-variant-numeric:tabular-nums;transition:color .2s;white-space:nowrap}
 .speed small{font-size:.22em;color:var(--muted);font-weight:600;margin-left:6px}
+/* 加速度センサーでの推定中は灰色（警告色は出さない） */
+.speedbox.estimating .speed{color:#8a94a8}
 .speedbox.warn-fast .speed{color:var(--red)}
 .speedbox.warn-slow .speed{color:var(--blue)}
 .delta{color:var(--muted);font-variant-numeric:tabular-nums;white-space:nowrap}

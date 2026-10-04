@@ -1,6 +1,6 @@
 // オフラインでも起動できるようにアプリ本体をキャッシュする。
 // キャッシュから即表示 → 裏で最新版を取得（次回起動時に反映）。
-const CACHE = 'drive-meter-v5';
+const CACHE = 'drive-meter-v6';
 const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest',
                 './icons/icon-192.png', './icons/icon-512.png'];
 
