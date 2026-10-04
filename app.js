@@ -478,13 +478,17 @@ async function requestWake() {
 }
 function releaseWake() { try { wakeLock && wakeLock.release(); } catch {} wakeLock = null; }
 
+// 記録中かどうかを端末に残し、再読み込みやアプリの再起動後も記録を続ける
+function setRecFlag(on) { try { on ? localStorage.setItem('drv.rec', '1') : localStorage.removeItem('drv.rec'); } catch {} }
 function startRec() {
   ensureAudio();
   if (!demo) startGps();
   rec = true; requestWake(); updateRecBtn();
+  if (!demo) setRecFlag(true);
 }
 function stopRec() {
   rec = false; releaseWake(); save(); updateRecBtn();
+  setRecFlag(false);
 }
 function updateRecBtn() {
   const b = $('btnRec');
@@ -1213,6 +1217,7 @@ $('btnReset').onclick = () => {
 startRenderLoop();
 applyLayout();
 updateRecBtn();
+try { if (localStorage.getItem('drv.rec') === '1') startRec(); } catch {}   // 記録中に閉じた／再読み込みした
 // すでに位置情報が許可されていれば、記録前から速度を表示
 navigator.permissions?.query({ name: 'geolocation' }).then(p => { if (p.state === 'granted') startGps(); }).catch(() => {});
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
