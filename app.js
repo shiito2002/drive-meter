@@ -166,6 +166,8 @@ function colorFor(v) {
   const c = r < 0 ? b : rd, t = Math.abs(r);
   return `rgb(${g.map((x, k) => Math.round(x + (c[k] - x) * t)).join(',')})`;
 }
+// 高度グラフの色：色を持たない明るいグレー（速度の青・緑・赤を目立たせる）
+const ALT = { line: '#d4dbe6', label: '#cbd5e1', fillTop: '#94a3b866', fillBottom: '#94a3b812', spark: '#94a3b84d' };
 const scaleMax = () => Math.max(100, Math.ceil((S.target + S.tol) * 1.5 / 20) * 20);
 
 function ensureAudio() {
@@ -403,7 +405,7 @@ function drawSpark(cv, m) {
     const lo = Math.min(...al), hi = Math.max(lo + 40, Math.max(...al));
     ctx.beginPath(); ctx.moveTo(0, H);
     m.sa.forEach((a, k) => ctx.lineTo(X(k), a == null ? H : H - (a - lo) / (hi - lo) * H * 0.9));
-    ctx.lineTo(W, H); ctx.fillStyle = '#a78bfa33'; ctx.fill();
+    ctx.lineTo(W, H); ctx.fillStyle = ALT.spark; ctx.fill();
   }
   const vMax = Math.max(scaleMax(), ...m.sv);
   ctx.lineWidth = 1.5;
@@ -654,7 +656,7 @@ function drawChart(cv, src, x0, x1, o) {
     ctx.beginPath(); ctx.moveTo(pad.l, Yv(v)); ctx.lineTo(pad.l + w, Yv(v)); ctx.stroke();
     ctx.fillText(v, pad.l - 4, Yv(v) + 3);
   }
-  ctx.fillStyle = '#a78bfa'; ctx.textAlign = 'left';
+  ctx.fillStyle = ALT.label; ctx.textAlign = 'left';
   for (let a = aLo; a <= aHi + 1e-6; a += aStep) ctx.fillText(Math.round(a) + 'm', pad.l + w + 4, Ya(a) + 3);
 
   // 設定速度 ±許容幅 の帯（高度の面より上に描く）
@@ -681,9 +683,9 @@ function drawChart(cv, src, x0, x1, o) {
     for (const p of ap) ctx.lineTo(p.x, Ya(p.a));
     ctx.lineTo(ap[ap.length - 1].x, pad.t + h); ctx.closePath();
     const gr = ctx.createLinearGradient(0, pad.t, 0, pad.t + h);
-    gr.addColorStop(0, '#a78bfa55'); gr.addColorStop(1, '#a78bfa08');
+    gr.addColorStop(0, ALT.fillTop); gr.addColorStop(1, ALT.fillBottom);
     ctx.fillStyle = gr; ctx.fill();
-    ctx.strokeStyle = '#a78bfa'; ctx.lineWidth = 1.2; ctx.beginPath();
+    ctx.strokeStyle = ALT.line; ctx.lineWidth = 2; ctx.beginPath();
     ap.forEach((p, k) => (k && !p.brk) ? ctx.lineTo(p.x, Ya(p.a)) : ctx.moveTo(p.x, Ya(p.a)));
     ctx.stroke();
   }
