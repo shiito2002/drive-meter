@@ -267,32 +267,33 @@ function demAt(lat, lng) {
   return tile[t.i];
 }
 // ===================== トンネル内の速度推定（加速度センサー） =====================
-// GPSが良い間に「端末の加速度ベクトル → 車の前後加速度」の対応を学習しておき
-// （前後加速度 ≒ f·a + c、f と c を最小二乗で推定）、GPSが途切れたら最後の速度から積分して推定する。
-// 時間とともに誤差がたまる（目安：30秒で±5km/h、1分で±10km/h）ので、推定中は灰色で表示する。
+// GPSが良い間に「端末の加速度ベクトル → 車の前後加速度」の対応を学習しておき、
+// GPSが途切れたら最後の速度から加速度を積分して推定する（推定中は灰色で表示）。
+// 実機で確かめたこと：スマホのGPS速度は加速度より2〜3秒遅れて変化し、1秒ごとの速度差はばらつきが大きい。
+// そこで「3秒間の速度差」と「遅れ分ずらした3秒間の平均加速度」を比べ、遅れ（0〜4秒）も自動で選ぶ。
 const IMU = {
-  R: new Float64Array(16), b: new Float64Array(4),   // 正規方程式（古いデータは少しずつ忘れる）
-  f: null, n: 0,                // 学習結果 [fx, fy, fz, c] / 加減速のあった学習回数
-  sum: [0, 0, 0], cnt: 0,       // GPS更新の間の平均加速度
+  hist: [],                     // GPS更新ごとの { t, v[m/s], m:[x,y,z] その間の平均加速度, ok }
+  model: null,                  // 学習結果 { u: 前方向（単位ベクトル）, s: 倍率, beta: 補正, lag: 遅れ[秒], corr: 相関 }
+  fit: { n: 0, corr: 0 },       // 直近の学習の状況（設定画面に表示）
+  lastFit: 0,
+  sum: [0, 0, 0], cnt: 0,       // GPS更新の間の加速度の合計
   lastT: 0, prevGps: null,      // 前回のセンサー時刻 / 前回のGPS { t, v[m/s] }
   lp: [0, 0, 0], vib: 0, vibStop: null, vibMove: null, still: 0,   // 細かい振動の大きさ（停車判定用）
   est: null,                    // 推定中 { v[m/s], since[ms] }
   events: 0,
 };
-const IMU_MIN_N = 15;           // 加減速がこの回数あれば学習完了
+const IMU_W = 3;                // 速度差を見る幅[秒]
+const IMU_MAXLAG = 4;           // 試すGPSの遅れ[秒]
+const IMU_MIN_PAIRS = 90;       // 学習に使う組の最低数（約1.5分ぶん）
+const IMU_MIN_CORR = 0.35;      // これ以上の相関があれば採用
 try {
   const L = JSON.parse(localStorage.getItem('drv.imu'));
-  if (L && L.R && L.R.length === 16) {
-    IMU.R.set(L.R); IMU.b.set(L.b); IMU.n = L.n; IMU.f = L.f;
-    IMU.vibStop = L.vibStop; IMU.vibMove = L.vibMove;
-  }
+  if (L && L.model) { IMU.model = L.model; IMU.fit = { n: L.model.n, corr: L.model.corr }; }
+  if (L) { IMU.vibStop = L.vibStop ?? null; IMU.vibMove = L.vibMove ?? null; }
 } catch {}
 function saveImu() {
-  if (!IMU.n && IMU.vibMove == null) return;
-  try {
-    localStorage.setItem('drv.imu', JSON.stringify({ R: [...IMU.R], b: [...IMU.b], n: IMU.n, f: IMU.f,
-      vibStop: IMU.vibStop, vibMove: IMU.vibMove }));
-  } catch {}
+  if (!IMU.model && IMU.vibMove == null) return;
+  try { localStorage.setItem('drv.imu', JSON.stringify({ model: IMU.model, vibStop: IMU.vibStop, vibMove: IMU.vibMove })); } catch {}
 }
 
 addEventListener('devicemotion', e => {
@@ -303,6 +304,8 @@ addEventListener('devicemotion', e => {
   imuSample(a.x, a.y, a.z, dt);
 });
 
+const imuForward = (md, x, y, z) => md.s * (md.u[0] * x + md.u[1] * y + md.u[2] * z - md.beta);
+
 function imuSample(x, y, z, dt) {
   IMU.sum[0] += x; IMU.sum[1] += y; IMU.sum[2] += z; IMU.cnt++;
   // 細かい振動だけを見る（0.3秒より遅い加減速は除く）→ 約1秒の二乗平均
@@ -312,11 +315,8 @@ function imuSample(x, y, z, dt) {
   IMU.vib += (hx * hx + hy * hy + hz * hz - IMU.vib) * Math.min(1, dt);
   const E = IMU.est;
   if (!E || dt <= 0) return;
-  if (IMU.f) {
-    const f = IMU.f;
-    E.v = Math.min(70, Math.max(0, E.v + (f[0] * x + f[1] * y + f[2] * z + f[3]) * dt));
-  }
-  // 振動がほとんどない状態が2秒続いたら停車とみなす（停車中と走行中の振動を学習済みのときだけ）
+  if (IMU.model) E.v = Math.min(70, Math.max(0, E.v + imuForward(IMU.model, x, y, z) * dt));
+  // 振動がほとんどない状態が続いたら停車とみなす（停車中と走行中の振動を学習済みのときだけ）
   if (IMU.vibStop != null && IMU.vibMove != null && IMU.vibMove > IMU.vibStop * 3) {
     const thr = Math.sqrt(IMU.vibStop * IMU.vibMove);
     IMU.still = IMU.vib < thr ? IMU.still + dt : 0;
@@ -324,32 +324,58 @@ function imuSample(x, y, z, dt) {
   }
 }
 
-// GPSを受信するたび：推定を終了し、精度の良い点で学習する
+// GPSを受信するたび：推定を終了し、学習用の記録を足す
 function imuOnGps(t, vKmh, acc) {
   IMU.est = null;
-  const v = vKmh / 3.6, p = IMU.prevGps;
-  if (acc <= 20 && IMU.cnt > 10 && p && t - p.t >= 500 && t - p.t <= 2500 && (v > 1.5 || p.v > 1.5)) {
-    const ag = (v - p.v) / ((t - p.t) / 1000);                       // GPSから求めた前後加速度
-    const m = [IMU.sum[0] / IMU.cnt, IMU.sum[1] / IMU.cnt, IMU.sum[2] / IMU.cnt, 1];
-    const L = 0.995;
-    for (let i = 0; i < 4; i++) {
-      IMU.b[i] = L * IMU.b[i] + m[i] * ag;
-      for (let j = 0; j < 4; j++) IMU.R[i * 4 + j] = L * IMU.R[i * 4 + j] + m[i] * m[j];
+  const v = vKmh / 3.6, p = IMU.prevGps, last = IMU.hist[IMU.hist.length - 1];
+  if (IMU.cnt) {
+    const ok = acc <= 20 && !!last && t - last.t >= 500 && t - last.t <= 2500;
+    IMU.hist.push({ t, v, m: IMU.sum.map(x => x / IMU.cnt), ok });
+    if (IMU.hist.length > 900) IMU.hist.shift();            // 直近15分ぶん
+    if (acc <= 20) {
+      if (v < 0.3 && p && p.v < 0.3) IMU.vibStop = IMU.vibStop == null ? IMU.vib : IMU.vibStop + (IMU.vib - IMU.vibStop) * 0.05;
+      if (v > 8) IMU.vibMove = IMU.vibMove == null ? IMU.vib : IMU.vibMove + (IMU.vib - IMU.vibMove) * 0.05;
     }
-    if (Math.abs(ag) > 0.3) IMU.n++;
-    if (IMU.n >= IMU_MIN_N) {
-      const f = solve4(IMU.R, IMU.b);
-      const len = f && Math.hypot(f[0], f[1], f[2]);
-      if (f && len > 0.5 && len < 1.6) IMU.f = f;                      // 向きの大きさが1前後なら採用
-    }
-  }
-  if (acc <= 20 && IMU.cnt) {
-    const vib = IMU.vib;
-    if (v < 0.3 && p && p.v < 0.3) IMU.vibStop = IMU.vibStop == null ? vib : IMU.vibStop + (vib - IMU.vibStop) * 0.05;
-    if (v > 8) IMU.vibMove = IMU.vibMove == null ? vib : IMU.vibMove + (vib - IMU.vibMove) * 0.05;
   }
   IMU.sum = [0, 0, 0]; IMU.cnt = 0;
   if (acc <= MAX_ACC) IMU.prevGps = { t, v };
+  if (t - IMU.lastFit > 20000) { IMU.lastFit = t; imuFit(); }
+}
+
+// 直近の記録から、遅れ 0〜4秒それぞれで「前方向・倍率・補正・相関」を求め、いちばん合うものを採用する
+function imuFit() {
+  const H = IMU.hist, W = IMU_W, mean = a => a.reduce((s, x) => s + x, 0) / a.length;
+  let best = null;
+  for (let lag = 0; lag <= IMU_MAXLAG; lag++) {
+    const A = [], Mw = [];
+    for (let i = W + lag; i < H.length; i++) {
+      let ok = H[i].v > 1.5;
+      for (let j = i - W - lag + 1; j <= i && ok; j++) ok = H[j].ok;
+      if (!ok) continue;
+      A.push((H[i].v - H[i - W].v) / ((H[i].t - H[i - W].t) / 1000));
+      const w = [0, 0, 0];
+      for (let j = i - W + 1 - lag; j <= i - lag; j++) for (let c = 0; c < 3; c++) w[c] += H[j].m[c] / W;
+      Mw.push(w);
+    }
+    if (A.length < 20) continue;
+    const ma = mean(A), va = mean(A.map(a => (a - ma) ** 2));
+    if (va < 0.005) continue;                                  // 加減速がほとんどない
+    const mm = [0, 1, 2].map(c => mean(Mw.map(w => w[c])));
+    const g = [0, 1, 2].map(c => mean(Mw.map((w, i) => (w[c] - mm[c]) * (A[i] - ma))) / va);
+    const gl = Math.hypot(...g);
+    if (!gl) continue;
+    const u = g.map(x => x / gl);
+    const P = Mw.map(w => u[0] * w[0] + u[1] * w[1] + u[2] * w[2]), mp = mean(P);
+    const vp = mean(P.map(x => (x - mp) ** 2)), cpa = mean(P.map((x, i) => (x - mp) * (A[i] - ma)));
+    const corr = cpa / Math.sqrt(vp * va);
+    if (!best || corr > best.corr) {
+      const s = Math.min(1.8, Math.max(0.7, cpa / vp));
+      best = { u, s, beta: mp - ma / s, lag, corr, n: A.length };
+    }
+  }
+  if (!best) return;
+  IMU.fit = { n: best.n, corr: best.corr };
+  if (best.n >= IMU_MIN_PAIRS && best.corr >= IMU_MIN_CORR) { IMU.model = best; saveImu(); }
 }
 
 // 走行中にGPSが2.5秒以上途切れたら推定を始める
@@ -357,25 +383,16 @@ function imuMaybeStart() {
   if (IMU.est || demo || watchId == null || !IMU.prevGps || !IMU.lastT) return;
   const lost = Date.now() - lastFix;
   if (lost > 2500 && IMU.prevGps.v * 3.6 >= STOP_KMH && performance.now() - IMU.lastT < 1000) {
-    IMU.est = { v: IMU.prevGps.v, since: lastFix };
+    let v = IMU.prevGps.v;
+    const md = IMU.model;
+    if (md) {
+      // GPS速度の遅れぶん（直前 lag 秒）と、途切れてからの2.5秒ぶんの加速度を足しておく
+      if (md.lag) for (const h of IMU.hist.slice(-md.lag)) v += imuForward(md, ...h.m);
+      if (IMU.cnt) v += imuForward(md, ...IMU.sum.map(x => x / IMU.cnt)) * lost / 1000;
+    }
+    IMU.est = { v: Math.max(0, v), since: lastFix };
     IMU.still = 0;
   }
-}
-
-function solve4(R, b) {     // (R + εI) f = b をガウスの消去法で解く
-  const A = [];
-  for (let i = 0; i < 4; i++) { A.push([...R.slice(i * 4, i * 4 + 4), b[i]]); A[i][i] += 1e-4; }
-  for (let c = 0; c < 4; c++) {
-    let piv = c;
-    for (let r = c + 1; r < 4; r++) if (Math.abs(A[r][c]) > Math.abs(A[piv][c])) piv = r;
-    if (Math.abs(A[piv][c]) < 1e-12) return null;
-    [A[c], A[piv]] = [A[piv], A[c]];
-    for (let r = 0; r < 4; r++) if (r !== c) {
-      const k = A[r][c] / A[c][c];
-      for (let j = c; j < 5; j++) A[r][j] -= k * A[c][j];
-    }
-  }
-  return A.map((row, i) => row[4] / row[i]);
 }
 
 function recomputeGain(d) {
@@ -889,7 +906,7 @@ function render() {
   $('dTarget').textContent = S.target;
   $('dTol').textContent = S.tol;
   $('dDiff').textContent = v == null ? ''
-    : est != null ? `　推定 ${fmtMS((Date.now() - IMU.est.since) / 1000)}${IMU.f ? '' : '（学習前のため速度を保持）'}`
+    : est != null ? `　推定 ${fmtMS((Date.now() - IMU.est.since) / 1000)}${IMU.model ? '' : '（学習前のため速度を保持）'}`
     : `　差 ${v - S.target >= 0 ? '+' : ''}${Math.round(v - S.target)}`;
 
   // --- 速度バー（設定速度 ± barHalf の範囲を拡大） ---
@@ -1173,8 +1190,9 @@ function syncForm() {
     ch.querySelectorAll('button').forEach(b => b.classList.toggle('sel', +b.textContent === v));
   });
   $('btnDemo').textContent = demo ? 'デモ走行を終了' : 'デモ走行を開始';
-  const imu = !IMU.events ? '加速度センサー：未検出' : IMU.f ? '加速度センサー：学習済み（トンネル内で推定可）'
-    : `加速度センサー：学習中 ${Math.min(IMU.n, IMU_MIN_N)}/${IMU_MIN_N}（加速・減速するたびに進みます）`;
+  const imu = !IMU.events ? '加速度センサー：未検出'
+    : IMU.model ? `加速度センサー：学習済み（相関 ${IMU.model.corr.toFixed(2)}・GPSの遅れ ${IMU.model.lag}秒）`
+    : `加速度センサー：学習中（データ ${Math.min(IMU.fit.n, IMU_MIN_PAIRS)}/${IMU_MIN_PAIRS}・相関 ${IMU.fit.corr.toFixed(2)}）`;
   $('info').textContent = `記録点数 ${D.V.length}　/　データ量 約${Math.round(JSON.stringify(D).length / 1024)}KB　/　${imu}`;
 }
 function onField(id) {
