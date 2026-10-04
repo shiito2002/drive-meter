@@ -42,18 +42,20 @@
       <div class="stat"><span>平均（走行中）</span><b id="sAvg">--</b></div>
       <div class="stat"><span>走行距離</span><b id="sDist">--</b></div>
       <div class="stat"><span>記録時間</span><b id="sTime">--</b></div>
-      <div class="stat"><span id="sAltLbl">現在高度</span><b id="sAlt">--</b></div>
+      <div class="stat"><span id="sAltLbl">現在標高</span><b id="sAlt">--</b></div>
       <div class="stat"><span>累積上昇</span><b id="sGain">--</b></div>
     </div>
   </section>
   <section class="chart recent">
-    <div class="ttl" id="recentTtl">直近 5分</div>
+    <div class="ttl"><span id="recentTtl">直近 5分</span><span id="muni" class="muni" hidden></span></div>
     <canvas id="cRecent"></canvas>
   </section>
   <section class="chart all">
     <div class="ttl" id="allTtl">ドライブ全体</div>
     <canvas id="cAll"></canvas>
   </section>
+  <!-- 市町村の境界通知 -->
+  <div id="notice" class="notice"><div class="from" id="noticeFrom"></div><div class="to"><span id="noticeTo"></span><small>に入りました</small></div></div>
 </div>
 
 <!-- 記録一覧 -->
@@ -139,8 +141,13 @@
       <input id="fBeep" type="checkbox">
     </div>
 
+    <div class="field row">
+      <label for="fMuniSound">市町村が変わったときに音を鳴らす</label>
+      <input id="fMuniSound" type="checkbox">
+    </div>
+
     <div class="field">
-      <label for="fAltOff">高度の補正値（GPS高度は海抜より30〜40m高く出ることが多いため）</label>
+      <label for="fAltOff">GPS高度の補正値（標高データが取れないときだけ使用。GPS高度は海抜より30〜40m高く出ることが多いため）</label>
       <div class="num"><input id="fAltOff" type="number" inputmode="numeric" min="-100" max="100" step="1"><span>m</span></div>
     </div>
 
@@ -149,6 +156,7 @@
       <button type="button" id="btnReset" class="danger">記録をリセット</button>
     </div>
     <p id="info" class="info"></p>
+    <p class="info">標高・市町村：国土地理院（標高タイル・住所検索API）。位置情報はこれらの取得のためだけに国土地理院へ送られます。</p>
     <button class="close" value="close">閉じる</button>
   </form>
 </dialog>

@@ -3,7 +3,8 @@ const $ = id => document.getElementById(id);
 const app = $('app');
 
 // ===================== 設定 =====================
-const DEFAULTS = { target: 60, tol: 10, winMin: 5, layout: 'auto', beep: false, altOffset: -35, refresh: 1, barHalf: 20 };
+const DEFAULTS = { target: 60, tol: 10, winMin: 5, layout: 'auto', beep: false, altOffset: -35, refresh: 1, barHalf: 20,
+                   muniSound: true };
 const S = loadJSON('drv.settings', DEFAULTS);
 function loadJSON(key, def) {
   try { const v = JSON.parse(localStorage.getItem(key)); return v ? Object.assign({}, def, v) : { ...def }; }
@@ -14,9 +15,10 @@ function saveSettings() { try { localStorage.setItem('drv.settings', JSON.string
 // ===================== 記録データ =====================
 // RT: 記録時間[s]（一時停止・GPS途切れを除いた経過）, T: 時刻[ms], V: 速度[km/h], A: 高度[m],
 // B: 1 = 直前と途切れている（グラフの線をつながない）
+// M: 通過した市町村 [{ i: 記録点の番号, n: 市町村名 }]
 // id / name / savedLen: 保存済みならその記録のID・名前・保存時点の点数
 function newSession() {
-  return { RT: [], T: [], V: [], A: [], LAT: [], LNG: [], B: [],
+  return { RT: [], T: [], V: [], A: [], LAT: [], LNG: [], B: [], M: [],
            dist: 0, moving: 0, recTime: 0, maxV: 0, maxI: -1, gain: 0, loss: 0, altRef: null };
 }
 const validData = d => d && Array.isArray(d.V) && Array.isArray(d.RT) && d.V.length === d.RT.length;
@@ -25,6 +27,7 @@ function loadSession() {
   catch { return null; }
 }
 let D = loadSession() || newSession();
+D.M = D.M || [];
 const unsaved = () => D.V.length > 0 && D.V.length !== (D.savedLen || 0);
 
 let rec = false;          // 記録中か
@@ -33,6 +36,7 @@ let demoTimer = null;
 let watchId = null;
 let lastFix = 0, lastAcc = null, lastAltAcc = null, liveV = null;
 let altS = lastNonNull(D.A);   // 平滑化した高度
+let altSrc = null;              // 'dem'（国土地理院） / 'gps'
 let warn = null;          // null / 'fast'（超過） / 'slow'（低下）
 let view = null;          // 見返し中の記録 { id, name, R, ci }
 let wakeLock = null, audioCtx = null, dirty = false;
@@ -91,12 +95,18 @@ function onPosition(pos) {
   if (v < 1.5) v = 0;
   liveV = v;
   updateWarn(v);
+  if (c.accuracy <= MAX_ACC) maybeQueryMuni(c.latitude, c.longitude, v);
 
   if (!rec || c.accuracy > MAX_ACC || (n && dt <= 0)) { requestRender(); return; }
 
-  if (c.altitude != null) {
-    const raw = c.altitude + S.altOffset;
-    altS = (altS == null || gap) ? raw : altS + (raw - altS) * 0.15;
+  // 標高：国土地理院の標高タイルを優先し、取れないときはGPSの高度（＋補正値）
+  const dem = demo ? undefined : demAt(c.latitude, c.longitude);
+  const src = dem !== undefined ? 'dem' : 'gps';
+  const raw = dem !== undefined ? dem : c.altitude != null ? c.altitude + S.altOffset : null;
+  const switched = altSrc != null && src !== altSrc;
+  if (raw != null) {
+    altS = (altS == null || gap || switched) ? raw : altS + (raw - altS) * (src === 'dem' ? 0.5 : 0.15);
+    altSrc = src;
   }
   const a = altS;
 
@@ -106,7 +116,7 @@ function onPosition(pos) {
     if (v >= STOP_KMH) D.moving += dt;
   }
   if (a != null) {
-    if (D.altRef == null || gap) D.altRef = a;   // 途切れている間の高低差は数えない
+    if (D.altRef == null || gap || switched) D.altRef = a;   // 途切れ・取得元の切り替えでの段差は数えない
     const da = a - D.altRef;
     if (da >= ALT_STEP) { D.gain += da; D.altRef = a; }
     else if (da <= -ALT_STEP) { D.loss -= da; D.altRef = a; }
@@ -115,9 +125,153 @@ function onPosition(pos) {
   D.RT.push(r1(D.recTime)); D.T.push(t); D.V.push(r1(v)); D.A.push(a == null ? null : r1(a));
   D.LAT.push(r6(c.latitude)); D.LNG.push(r6(c.longitude)); D.B.push(gap ? 1 : 0);
   if (v > D.maxV) { D.maxV = v; D.maxI = D.V.length - 1; }
+  const lastM = D.M[D.M.length - 1];
+  if (muni.name && (!lastM || lastM.n !== muni.name)) D.M.push({ i: D.V.length - 1, n: muni.name });
 
   dirty = true;
   requestRender();
+}
+
+// ===================== 市町村（国土地理院 住所検索API） =====================
+const MUNI_TABLE_URL = 'https://maps.gsi.go.jp/js/muni.js';
+const RGEO_URL = 'https://mreversegeocoder.gsi.go.jp/reverse-geocoder/LonLatToAddress';
+const MUNI_INTERVAL = 20000;   // 問い合わせ間隔[ms]
+let muniTable = null;
+try { muniTable = JSON.parse(localStorage.getItem('drv.muniTable')); } catch {}
+const muni = { name: null, cand: null, candN: 0, lastQ: 0, lastLat: null, lastLng: null, busy: false };
+
+async function ensureMuniTable() {
+  if (muniTable) return muniTable;
+  const txt = await (await fetch(MUNI_TABLE_URL)).text();
+  const t = {};
+  for (const m of txt.matchAll(/MUNI_ARRAY\["(\d+)"\]\s*=\s*'([^']*)'/g)) {
+    t[m[1]] = m[2].split(',')[3].split('　')[0];       // 「札幌市　中央区」→「札幌市」
+  }
+  muniTable = t;
+  try { localStorage.setItem('drv.muniTable', JSON.stringify(t)); } catch {}
+  return t;
+}
+async function queryMuni(lat, lng) {
+  const [t, j] = await Promise.all([ensureMuniTable(),
+    fetch(`${RGEO_URL}?lat=${lat.toFixed(6)}&lon=${lng.toFixed(6)}`).then(r => r.json())]);
+  const cd = j && j.results && j.results.muniCd;
+  return cd ? (t[String(parseInt(cd, 10))] || null) : null;   // 海の上などは null
+}
+// デモ走行用：走行距離で市町村が変わったことにする
+function demoMuni() {
+  const km = D.dist % 80;
+  return km < 15 ? '北見市' : km < 35 ? '訓子府町' : km < 60 ? '置戸町' : '北見市';
+}
+function maybeQueryMuni(lat, lng, v) {
+  const now = Date.now(), interval = demo ? 2000 : MUNI_INTERVAL;
+  if (muni.busy || now - muni.lastQ < interval) return;
+  if (muni.name && v < STOP_KMH && muni.lastLat != null && hav(muni.lastLat, muni.lastLng, lat, lng) < 100) return;  // 止まっている
+  muni.busy = true; muni.lastQ = now; muni.lastLat = lat; muni.lastLng = lng;
+  (demo ? Promise.resolve(demoMuni()) : queryMuni(lat, lng))
+    .then(name => { if (name) onMuni(name); })
+    .catch(() => {})
+    .finally(() => { muni.busy = false; });
+}
+// 境目で行ったり来たりしないよう、2回続けて同じ新しい市町村なら切り替える
+function onMuni(name) {
+  if (name === muni.name) { muni.cand = null; return; }
+  if (!muni.name) { muni.name = name; requestRender(); return; }
+  if (muni.cand === name && ++muni.candN >= 2) {
+    const from = muni.name;
+    muni.name = name; muni.cand = null;
+    showNotice(from, name);
+    requestRender();
+  } else if (muni.cand !== name) {
+    muni.cand = name; muni.candN = 1;
+    muni.lastQ = Date.now() - (demo ? 2000 : MUNI_INTERVAL) + 5000;   // 確認のため5秒後にもう一度
+  }
+}
+let noticeTimer = null;
+function showNotice(from, to) {
+  $('noticeFrom').textContent = `${from} →`;
+  $('noticeTo').textContent = to;
+  $('notice').classList.add('show');
+  clearTimeout(noticeTimer);
+  noticeTimer = setTimeout(() => $('notice').classList.remove('show'), 3000);
+  if (S.muniSound) chime();
+}
+function chime() {
+  if (!audioCtx) return;
+  const t = audioCtx.currentTime;
+  [[880, 0], [1318.5, 0.16]].forEach(([f, dt]) => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine'; o.frequency.value = f;
+    g.gain.setValueAtTime(0.0001, t + dt); g.gain.exponentialRampToValueAtTime(0.25, t + dt + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + dt + 0.5);
+    o.connect(g).connect(audioCtx.destination); o.start(t + dt); o.stop(t + dt + 0.55);
+  });
+}
+// 記録の i 番目の地点の市町村
+function muniAtIndex(d, i) {
+  let name = null;
+  for (const m of d.M || []) { if (m.i <= i) name = m.n; else break; }
+  return name;
+}
+
+// ===================== 標高（国土地理院 標高タイル） =====================
+// 10mメッシュの標高PNGタイル（z14 ≒ 1.8km四方）。取得したタイルは端末に保存して電波がなくても使う
+const DEM_Z = 14;
+const demUrl = (x, y) => `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${DEM_Z}/${x}/${y}.png`;
+const demTiles = new Map();   // "x/y" → Float32Array（標高[m]、なしはNaN） / null（タイルなし） / 'loading'
+function tileXY(lat, lng) {
+  const n = 2 ** DEM_Z, r = lat * Math.PI / 180;
+  const xf = (lng + 180) / 360 * n, yf = (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * n;
+  const x = Math.floor(xf), y = Math.floor(yf);
+  return { x, y, key: x + '/' + y, i: Math.min(255, Math.floor((yf - y) * 256)) * 256 + Math.min(255, Math.floor((xf - x) * 256)) };
+}
+async function loadDemTile(x, y) {
+  const key = x + '/' + y;
+  if (demTiles.has(key)) return demTiles.get(key);
+  demTiles.set(key, 'loading');
+  try {
+    const url = demUrl(x, y);
+    const cache = await caches.open('dem-tiles');
+    let res = await cache.match(url);
+    if (!res) {
+      res = await fetch(url);
+      if (res.status === 404) { demTiles.set(key, null); return null; }   // 海など
+      if (!res.ok) throw new Error(res.status);
+      await cache.put(url, res.clone());
+    }
+    const bmp = await createImageBitmap(await res.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
+    const cv = new OffscreenCanvas(256, 256), ctx = cv.getContext('2d', { willReadFrequently: true });
+    ctx.drawImage(bmp, 0, 0);
+    const px = ctx.getImageData(0, 0, 256, 256).data, out = new Float32Array(65536);
+    for (let i = 0; i < 65536; i++) {
+      const v = px[i * 4] * 65536 + px[i * 4 + 1] * 256 + px[i * 4 + 2];
+      out[i] = v === 8388608 ? NaN : (v < 8388608 ? v : v - 16777216) * 0.01;
+    }
+    if (demTiles.size > 80) demTiles.delete(demTiles.keys().next().value);   // 古いものから捨てる
+    demTiles.set(key, out);
+    return out;
+  } catch {
+    setTimeout(() => demTiles.delete(key), 30000);   // 電波がないときは30秒後に再挑戦
+    return null;
+  }
+}
+// その地点の標高。まだタイルがなければ読み込みを始めて undefined
+function demAt(lat, lng) {
+  const t = tileXY(lat, lng), tile = demTiles.get(t.key);
+  if (tile === undefined) { loadDemTile(t.x, t.y); return undefined; }
+  if (!(tile instanceof Float32Array) || isNaN(tile[t.i])) return undefined;
+  return tile[t.i];
+}
+function recomputeGain(d) {
+  let ref = null;
+  d.gain = 0; d.loss = 0;
+  for (let i = 0; i < d.A.length; i++) {
+    const a = d.A[i];
+    if (a == null) continue;
+    if (ref == null || d.B[i]) { ref = a; continue; }
+    const da = a - ref;
+    if (da >= ALT_STEP) { d.gain += da; ref = a; }
+    else if (da <= -ALT_STEP) { d.loss -= da; ref = a; }
+  }
 }
 
 function updateGpsStatus() {
@@ -234,7 +388,7 @@ function save() {
 setInterval(save, 15000);
 
 function resetSession() {
-  D = newSession(); altS = null; dirty = false;
+  D = newSession(); altS = null; altSrc = null; dirty = false;
   try { localStorage.removeItem('drv.session'); } catch {}
   renderNow();
 }
@@ -286,7 +440,10 @@ function makeMeta(id, name, d) {
     for (let i = i0; i < i1; i++) { s += d.V[i]; c++; if (d.A[i] != null) { as += d.A[i]; ac++; } }
     sv.push(c ? r1(s / c) : 0); sa.push(ac ? r1(as / ac) : null);
   }
-  return { id, name, start: d.T[0], end: d.T[n - 1], dist: d.dist, recTime: d.recTime, maxV: d.maxV, sv, sa };
+  const route = [];
+  for (const m of d.M || []) if (route[route.length - 1] !== m.n) route.push(m.n);
+  return { id, name, start: d.T[0], end: d.T[n - 1], dist: d.dist, recTime: d.recTime, maxV: d.maxV, sv, sa,
+           route, demFixed: !!d.demFixed };
 }
 const defaultName = d => `${new Date(d.T[0]).getMonth() + 1}/${new Date(d.T[0]).getDate()} ${hhmm(d.T[0])} のドライブ`;
 const rangeLabel = (a, b) => `${ymd(a)} ${hhmm(a)} 〜 ${ymd(a) === ymd(b) ? '' : ymd(b) + ' '}${hhmm(b)}`;
@@ -314,11 +471,71 @@ async function exportDrives(ids, fname) {
   const drives = [];
   for (const m of metas) { const x = await store.load(m.id); if (x) drives.push({ ...m, data: x.d }); }
   if (!drives.length) { alert('書き出す記録がありません'); return; }
-  const blob = new Blob([JSON.stringify({ app: 'drive-meter', version: 1, drives })], { type: 'application/json' });
+  download(new Blob([JSON.stringify({ app: 'drive-meter', version: 1, drives })], { type: 'application/json' }), fname);
+}
+function download(blob, fname) {
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob); a.download = fname;
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+}
+
+// GPX 1.1（速度は Garmin の TrackPointExtension に m/s で入れる）。途切れたところで区間を分ける
+function buildGpx(name, d) {
+  const iso = t => new Date(t).toISOString();
+  let segs = '', seg = '';
+  for (let i = 0; i < d.V.length; i++) {
+    if (i && d.B[i]) { segs += `  <trkseg>
+${seg}  </trkseg>
+`; seg = ''; }
+    seg += `   <trkpt lat="${d.LAT[i]}" lon="${d.LNG[i]}">${d.A[i] != null ? `<ele>${d.A[i]}</ele>` : ''}<time>${iso(d.T[i])}</time>`
+         + `<extensions><gpxtpx:TrackPointExtension><gpxtpx:speed>${(d.V[i] / 3.6).toFixed(2)}</gpxtpx:speed></gpxtpx:TrackPointExtension></extensions></trkpt>
+`;
+  }
+  if (seg) segs += `  <trkseg>
+${seg}  </trkseg>
+`;
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="ドライブ速度計" xmlns="http://www.topografix.com/GPX/1/1"
+ xmlns:gpxtpx="http://www.garmin.com/xmlschemas/TrackPointExtension/v2">
+ <metadata><name>${esc(name)}</name><time>${iso(d.T[0])}</time></metadata>
+ <trk>
+  <name>${esc(name)}</name>
+${segs} </trk>
+</gpx>
+`;
+}
+async function exportGpx(m) {
+  const x = await store.load(m.id);
+  if (!x) { alert('記録が見つかりません'); return; }
+  download(new Blob([buildGpx(m.name, x.d)], { type: 'application/gpx+xml' }),
+    `drive_${fileStamp(m.start)}_${safeName(m.name)}.gpx`);
+}
+
+// 保存済みの記録の標高を、国土地理院の標高タイルで置き換える
+async function fixElevation(m, btn) {
+  const x = await store.load(m.id);
+  if (!x) return;
+  const d = x.d, groups = new Map();
+  for (let i = 0; i < d.V.length; i++) {          // 必要なタイルごとに記録点をまとめる
+    const t = tileXY(d.LAT[i], d.LNG[i]);
+    if (!groups.has(t.key)) groups.set(t.key, { t, idx: [] });
+    groups.get(t.key).idx.push([i, t.i]);
+  }
+  let k = 0, fixed = 0;
+  for (const { t, idx } of groups.values()) {
+    btn.textContent = `補正中 ${++k}/${groups.size}`;
+    let tile = await loadDemTile(t.x, t.y);
+    if (tile === 'loading') { await new Promise(r => setTimeout(r, 500)); tile = demTiles.get(t.key); }
+    if (!(tile instanceof Float32Array)) continue;
+    for (const [i, pi] of idx) if (!isNaN(tile[pi])) { d.A[i] = r1(tile[pi]); fixed++; }
+  }
+  if (!fixed) { alert('標高データを取得できませんでした（電波を確認してください）'); showRecords(); return; }
+  recomputeGain(d);
+  d.demFixed = true;
+  await store.put(makeMeta(m.id, m.name, d), { id: m.id, d });
+  alert(`${fixed} / ${d.V.length} 地点の標高を国土地理院のデータに置き換えました`);
+  showRecords();
 }
 const fileStamp = ts => { const d = new Date(ts); return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}`; };
 const safeName = s => s.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
@@ -362,10 +579,14 @@ async function showRecords() {
   for (const m of list) {
     const el = document.createElement('div');
     el.className = 'item'; el.dataset.id = m.id;
+    const route = m.route && m.route.length ? `<div class="route">📍 ${m.route.map(esc).join(' → ')}</div>` : '';
     el.innerHTML = `<div class="n">${esc(m.name)}</div><div class="d">${rangeLabel(m.start, m.end)}</div>
-      <div class="s">${statsLine(m.dist, m.recTime, m.maxV)}</div><canvas></canvas>
+      <div class="s">${statsLine(m.dist, m.recTime, m.maxV)}</div>${route}<canvas></canvas>
       <div class="a"><button class="btn" data-act="open">開く</button><button class="btn" data-act="rename">名前変更</button>
-      <button class="btn" data-act="export">書き出し</button><button class="btn dan" data-act="del">削除</button></div>`;
+      <button class="btn" data-act="gpx">GPX</button><button class="btn" data-act="export">バックアップ</button>
+      ${m.demFixed ? '' : '<button class="btn" data-act="dem">標高補正</button>'}
+      <button class="btn dan" data-act="del">削除</button></div>
+      ${m.demFixed ? '<div class="d">標高：国土地理院のデータに補正済み</div>' : ''}`;
     box.appendChild(el);
     el._meta = m;
   }
@@ -383,6 +604,12 @@ $('recList').addEventListener('click', async e => {
     await store.rename(m.id, res.name);
     if (D.id === m.id) { D.name = res.name; dirty = true; save(); }
     showRecords();
+  } else if (b.dataset.act === 'gpx') {
+    exportGpx(m);
+  } else if (b.dataset.act === 'dem') {
+    if (b.disabled) return;
+    b.disabled = true;
+    try { await fixElevation(m, b); } catch { alert('標高の補正に失敗しました'); showRecords(); }
   } else if (b.dataset.act === 'export') {
     exportDrives([m.id], `drive-meter_${fileStamp(m.start)}_${safeName(m.name)}.json`);
   } else if (b.dataset.act === 'del') {
@@ -487,13 +714,13 @@ function makeDemo() {
 function toggleDemo() {
   if (view) closeReview();
   if (demo) {
-    clearInterval(demoTimer); demo = null; rec = false;
+    clearInterval(demoTimer); demo = null; rec = false; muni.name = null; muni.lastQ = 0;
     resetSession(); liveV = null; warn = null;
   } else {
     if (unsaved() && !confirm('デモ走行を始めると、保存していない記録はリセットされます。よろしいですか？')) return;
     if (rec) stopRec();
     resetSession();
-    demo = makeDemo();
+    demo = makeDemo(); muni.name = null; muni.lastQ = 0;
     rec = true;
     demoTimer = setInterval(() => onPosition(demo()), 100);
     $('settings').close();
@@ -566,7 +793,8 @@ function render() {
   setStat('sDist', has ? fmtDist(R.dist) : null, 'km');
   setStat('sTime', has ? fmtTime(R.recTime) : null, '');
   const alt = view ? R.A[ci] : altS;
-  $('sAltLbl').textContent = view ? 'この地点の高度' : '現在高度';
+  const srcLbl = view ? (R.demFixed ? '地理院' : '') : altSrc === 'dem' ? '地理院' : altSrc === 'gps' ? 'GPS' : '';
+  $('sAltLbl').innerHTML = (view ? 'この地点の標高' : '現在標高') + (srcLbl ? `<em class="src">${srcLbl}</em>` : '');
   setStat('sAlt', alt == null ? null : Math.round(alt), 'm');
   setStat('sGain', has ? Math.round(R.gain) : null, 'm');
 
@@ -576,16 +804,23 @@ function render() {
   if (view) {
     const rt = R.RT[ci];
     $('recentTtl').textContent = `${hhmm(R.T[ci])} の前後 ${winLabel(win)}`;
+    setMuniLabel(muniAtIndex(R, ci));
     $('allTtl').innerHTML = 'ドライブ全体<em>なぞって地点を選択</em>';
     drawChart($('cRecent'), R, rt - win / 2, rt + win / 2, { win, cursor: rt });
     drawChart(cvA, R, 0, Math.max(last, 60), { small: true, cursor: rt, cursorLabel: hhmm(R.T[ci]) });
   } else {
     const x0 = Math.max(0, last - win);
     $('recentTtl').textContent = `直近 ${winLabel(win)}`;
+    setMuniLabel(muni.name);
     $('allTtl').textContent = 'ドライブ全体';
     drawChart($('cRecent'), R, x0, x0 + win, { win, live: true });
     drawChart(cvA, R, 0, Math.max(last, 60), { small: true, win, frame: true });
   }
+}
+
+function setMuniLabel(name) {
+  $('muni').textContent = name ? `📍 ${name}` : '';
+  $('muni').hidden = !name;
 }
 
 function prep(cv) {
@@ -612,7 +847,8 @@ function niceStep(x) {
 // o: { small, win, live（現在点を表示）, frame（直近の範囲枠）, cursor（見返しの位置）, cursorLabel }
 function drawChart(cv, src, x0, x1, o) {
   const { ctx, W, H } = prep(cv);
-  const pad = { l: 30, r: 40, t: 26, b: o.small ? 6 : 16 };   // 上26pxはタイトル行
+  const bounds = o.small && src.M && src.M.length ? src.M : null;   // 市町村の境目
+  const pad = { l: 30, r: 40, t: 26, b: o.small ? (bounds ? 16 : 6) : 16 };   // 上26pxはタイトル行
   const w = W - pad.l - pad.r, h = H - pad.t - pad.b;
   if (w < 20 || h < 20) return;
   const span = Math.max(1, x1 - x0);
@@ -702,6 +938,24 @@ function drawChart(cv, src, x0, x1, o) {
 
   ctx.font = '10px system-ui, sans-serif';
   if (o.small) {
+    if (bounds) {           // 市町村の境目（点線）と名前
+      ctx.font = 'bold 10px system-ui, sans-serif'; ctx.textAlign = 'left';
+      let lastEnd = -Infinity;
+      bounds.forEach((m, k) => {
+        if (m.i >= src.RT.length) return;
+        const bx = X(src.RT[m.i]);
+        if (k) {
+          ctx.strokeStyle = '#22d3ee'; ctx.lineWidth = 1; ctx.setLineDash([3, 3]);
+          ctx.beginPath(); ctx.moveTo(bx, pad.t); ctx.lineTo(bx, pad.t + h); ctx.stroke(); ctx.setLineDash([]);
+        }
+        const tx = Math.max(bx + 3, lastEnd + 6);                // 名前どうしが重ならないように
+        if (tx < pad.l + w) {
+          ctx.fillStyle = '#22d3ee'; ctx.fillText(m.n, tx, H - 3);
+          lastEnd = tx + ctx.measureText(m.n).width;
+        }
+      });
+      ctx.font = '10px system-ui, sans-serif';
+    }
     if (o.frame) {          // 直近グラフの範囲を枠で表示
       const last = src.RT[src.RT.length - 1];
       const fx0 = X(Math.max(0, last - o.win)), fx1 = X(last);
@@ -784,6 +1038,7 @@ function syncForm() {
   for (const [id, key] of Object.entries(FIELDS)) $(id).value = S[key];
   $('fLayout').value = S.layout;
   $('fBeep').checked = S.beep;
+  $('fMuniSound').checked = S.muniSound;
   document.querySelectorAll('.chips').forEach(ch => {
     const v = +$(ch.dataset.for).value;
     ch.querySelectorAll('button').forEach(b => b.classList.toggle('sel', +b.textContent === v));
@@ -817,6 +1072,7 @@ $('btnSettings').onclick = () => {
   syncForm(); dlg.showModal();
   document.activeElement?.blur();   // 開いた瞬間にキーボードが出ないように
 };
+$('fMuniSound').onchange = e => { S.muniSound = e.target.checked; saveSettings(); if (S.muniSound) { ensureAudio(); chime(); } };
 $('btnDemo').onclick = toggleDemo;
 $('btnReset').onclick = () => {
   if (demo) { toggleDemo(); return; }
