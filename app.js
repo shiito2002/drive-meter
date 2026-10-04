@@ -37,6 +37,7 @@ let watchId = null;
 let lastFix = 0, lastAcc = null, lastAltAcc = null, liveV = null;
 let altS = lastNonNull(D.A);   // 平滑化した高度
 let altSrc = null;              // 'dem'（国土地理院） / 'gps'
+let altT = 0;                   // 標高を最後に更新した時刻
 let warn = null;          // null / 'fast'（超過） / 'slow'（低下）
 let view = null;          // 見返し中の記録 { id, name, R, ci }
 let wakeLock = null, audioCtx = null, dirty = false;
@@ -98,19 +99,21 @@ function onPosition(pos) {
   updateWarn(v);
   if (c.accuracy <= MAX_ACC) maybeQueryMuni(c.latitude, c.longitude, v);
   if (!pos.demo) imuOnGps(t, v, c.accuracy);
+  if (c.accuracy > MAX_ACC) { requestRender(); return; }
 
-  if (!rec || c.accuracy > MAX_ACC || (n && dt <= 0)) { requestRender(); return; }
-
-  // 標高：国土地理院の標高タイルを優先し、取れないときはGPSの高度（＋補正値）
+  // 標高：国土地理院の標高タイルを優先し、取れないときはGPSの高度（＋補正値）。記録していないときも表示用に更新
   const dem = demo ? undefined : demAt(c.latitude, c.longitude);
   const src = dem !== undefined ? 'dem' : 'gps';
   const raw = dem !== undefined ? dem : c.altitude != null ? c.altitude + S.altOffset : null;
   const switched = altSrc != null && src !== altSrc;
   if (raw != null) {
-    altS = (altS == null || gap || switched) ? raw : altS + (raw - altS) * (src === 'dem' ? 0.5 : 0.15);
-    altSrc = src;
+    const fresh = altS == null || switched || t - altT > GAP_SEC * 1000;
+    altS = fresh ? raw : altS + (raw - altS) * (src === 'dem' ? 0.5 : 0.15);
+    altSrc = src; altT = t;
   }
   const a = altS;
+
+  if (!rec || (n && dt <= 0)) { requestRender(); return; }
 
   if (!gap) {
     D.recTime += dt;
@@ -277,6 +280,20 @@ const IMU = {
   events: 0,
 };
 const IMU_MIN_N = 15;           // 加減速がこの回数あれば学習完了
+try {
+  const L = JSON.parse(localStorage.getItem('drv.imu'));
+  if (L && L.R && L.R.length === 16) {
+    IMU.R.set(L.R); IMU.b.set(L.b); IMU.n = L.n; IMU.f = L.f;
+    IMU.vibStop = L.vibStop; IMU.vibMove = L.vibMove;
+  }
+} catch {}
+function saveImu() {
+  if (!IMU.n && IMU.vibMove == null) return;
+  try {
+    localStorage.setItem('drv.imu', JSON.stringify({ R: [...IMU.R], b: [...IMU.b], n: IMU.n, f: IMU.f,
+      vibStop: IMU.vibStop, vibMove: IMU.vibMove }));
+  } catch {}
+}
 
 addEventListener('devicemotion', e => {
   const a = e.acceleration;     // 重力を除いた加速度（端末の座標系）
@@ -485,13 +502,14 @@ addEventListener('pagehide', save);
 
 // 記録中のドライブを端末に一時保存（アプリを閉じても続きから）
 function save() {
+  saveImu();
   if (demo || !dirty) return;
   try { localStorage.setItem('drv.session', JSON.stringify(D)); dirty = false; } catch {}
 }
 setInterval(save, 15000);
 
 function resetSession() {
-  D = newSession(); altS = null; altSrc = null; dirty = false;
+  D = newSession(); dirty = false;
   try { localStorage.removeItem('drv.session'); } catch {}
   renderNow();
 }
