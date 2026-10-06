@@ -92,6 +92,12 @@ body.reviewing #btnRec,body.reviewing #btnRecords{display:none}
 .notice .to{font-size:30px;font-weight:800;color:#22d3ee}
 .notice .to small{font-size:16px;color:var(--text);margin-left:8px;font-weight:600}
 
+/* 見返しでトンネル内（推定）を選んだときの説明 */
+.tuntip{font-size:12px;color:#cbd5e1;background:#8a94a822;border:1px dashed #8a94a8;border-radius:8px;padding:2px 8px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.tuntip[hidden]{display:none}
+.portrait .tuntip{order:1;margin:4px 10px 0}
+.item .tun{font-size:12px;color:#cbd5e1;margin-top:2px}
+
 /* 標高の取得元（地理院／GPS） */
 .stat span em.src{font-style:normal;color:var(--accent);margin-left:6px}
 
