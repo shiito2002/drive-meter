@@ -16,9 +16,10 @@ function saveSettings() { try { localStorage.setItem('drv.settings', JSON.string
 // RT: 記録時間[s]（一時停止・GPS途切れを除いた経過）, T: 時刻[ms], V: 速度[km/h], A: 高度[m],
 // B: 1 = 直前と途切れている（グラフの線をつながない）
 // M: 通過した市町村 [{ i: 記録点の番号, n: 市町村名 }]
+// Q: 各点のGPS精度[m] / EV: 診断用の出来事（画面の表示・非表示、精度の悪い測位、推定の結果など）
 // id / name / savedLen: 保存済みならその記録のID・名前・保存時点の点数
 function newSession() {
-  return { RT: [], T: [], V: [], A: [], LAT: [], LNG: [], B: [], M: [],
+  return { RT: [], T: [], V: [], A: [], LAT: [], LNG: [], B: [], M: [], Q: [], EV: [],
            dist: 0, moving: 0, recTime: 0, maxV: 0, maxI: -1, gain: 0, loss: 0, altRef: null };
 }
 const validData = d => d && Array.isArray(d.V) && Array.isArray(d.RT) && d.V.length === d.RT.length;
@@ -27,7 +28,7 @@ function loadSession() {
   catch { return null; }
 }
 let D = loadSession() || newSession();
-D.M = D.M || [];
+D.M = D.M || []; D.Q = D.Q || []; D.EV = D.EV || [];
 const unsaved = () => D.V.length > 0 && D.V.length !== (D.savedLen || 0);
 
 let rec = false;          // 記録中か
@@ -38,6 +39,9 @@ let lastFix = 0, lastAcc = null, lastAltAcc = null, liveV = null;
 let altS = lastNonNull(D.A);   // 平滑化した高度
 let altSrc = null;              // 'dem'（国土地理院） / 'gps'
 let altT = 0;                   // 標高を最後に更新した時刻
+let demLastT = 0;               // 地理院の標高を最後に取れた時刻
+let altV = 0;                   // 標高を最後に更新したときの速度[km/h]
+const MAX_GRADE = 0.12;         // 道路の最大勾配（12%）。これより急な標高変化は地形の読み違いとみなす
 let warn = null;          // null / 'fast'（超過） / 'slow'（低下）
 let view = null;          // 見返し中の記録 { id, name, R, ci }
 let wakeLock = null, audioCtx = null, dirty = false;
@@ -74,7 +78,19 @@ function startGps() {
     { enableHighAccuracy: true, maximumAge: 0, timeout: 15000 });
   updateGpsStatus();
 }
+// 診断用の出来事を記録に残す（記録中のみ）
+function logEv(ev) {
+  if (!rec || demo) return;
+  D.EV.push(ev); dirty = true;
+}
+function logBadAcc(t, acc) {        // 精度が悪くて捨てた測位は、続いている間を1件にまとめる
+  if (!rec || demo) return;
+  const ev = D.EV[D.EV.length - 1];
+  if (ev && ev.e === 'badacc' && t - ev.t2 < 5000) { ev.t2 = t; ev.n++; ev.max = Math.max(ev.max, Math.round(acc)); }
+  else logEv({ t, t2: t, e: 'badacc', n: 1, max: Math.round(acc) });
+}
 function onGpsError(e) {
+  logEv({ t: Date.now(), e: 'gpserr', code: e.code });
   if (e.code === 1) {
     alert('位置情報の使用が許可されていません。\nChrome のサイト設定で「位置情報」を許可してください。');
     navigator.geolocation.clearWatch(watchId); watchId = null;
@@ -99,17 +115,23 @@ function onPosition(pos) {
   updateWarn(v);
   if (c.accuracy <= MAX_ACC) maybeQueryMuni(c.latitude, c.longitude, v);
   if (!pos.demo) imuOnGps(t, v, c.accuracy);
-  if (c.accuracy > MAX_ACC) { requestRender(); return; }
+  if (c.accuracy > MAX_ACC) { logBadAcc(t, c.accuracy); requestRender(); return; }
 
   // 標高：国土地理院の標高タイルを優先し、取れないときはGPSの高度（＋補正値）。記録していないときも表示用に更新
   const dem = demo ? undefined : demAt(c.latitude, c.longitude);
+  if (dem !== undefined) demLastT = t;
+  const holdDem = dem === undefined && altSrc === 'dem' && t - demLastT < 15000;   // 読み込み待ちの間は据え置き
   const src = dem !== undefined ? 'dem' : 'gps';
   const raw = dem !== undefined ? dem : c.altitude != null ? c.altitude + S.altOffset : null;
-  const switched = altSrc != null && src !== altSrc;
-  if (raw != null) {
+  const switched = !holdDem && altSrc != null && src !== altSrc;
+  if (raw != null && !holdDem) {
     const fresh = altS == null || switched || t - altT > GAP_SEC * 1000;
-    altS = fresh ? raw : altS + (raw - altS) * (src === 'dem' ? 0.5 : 0.15);
-    altSrc = src; altT = t;
+    if (fresh) altS = raw;
+    else {
+      const lim = (altV + v) / 2 / 3.6 * ((t - altT) / 1000) * MAX_GRADE;   // その間に動いた距離 × 最大勾配
+      altS = Math.min(altS + lim, Math.max(altS - lim, altS + (raw - altS) * (src === 'dem' ? 0.5 : 0.15)));
+    }
+    altSrc = src; altT = t; altV = v;
   }
   const a = altS;
 
@@ -128,7 +150,7 @@ function onPosition(pos) {
   }
 
   D.RT.push(r1(D.recTime)); D.T.push(t); D.V.push(r1(v)); D.A.push(a == null ? null : r1(a));
-  D.LAT.push(r6(c.latitude)); D.LNG.push(r6(c.longitude)); D.B.push(gap ? 1 : 0);
+  D.LAT.push(r6(c.latitude)); D.LNG.push(r6(c.longitude)); D.B.push(gap ? 1 : 0); D.Q.push(Math.round(c.accuracy));
   if (v > D.maxV) { D.maxV = v; D.maxI = D.V.length - 1; }
   const lastM = D.M[D.M.length - 1];
   if (muni.name && (!lastM || lastM.n !== muni.name)) D.M.push({ i: D.V.length - 1, n: muni.name });
@@ -259,9 +281,16 @@ async function loadDemTile(x, y) {
     return null;
   }
 }
+const prefetchDem = (x, y) => { if (!demTiles.has(x + '/' + y)) loadDemTile(x, y); };
 // その地点の標高。まだタイルがなければ読み込みを始めて undefined
 function demAt(lat, lng) {
   const t = tileXY(lat, lng), tile = demTiles.get(t.key);
+  // タイルの端（約250m以内）に近づいたら、隣のタイルを先に読み込んでおく
+  const px = t.i % 256, py = t.i >> 8, E = 36;
+  const dx = px < E ? -1 : px > 255 - E ? 1 : 0, dy = py < E ? -1 : py > 255 - E ? 1 : 0;
+  if (dx) prefetchDem(t.x + dx, t.y);
+  if (dy) prefetchDem(t.x, t.y + dy);
+  if (dx && dy) prefetchDem(t.x + dx, t.y + dy);
   if (tile === undefined) { loadDemTile(t.x, t.y); return undefined; }
   if (!(tile instanceof Float32Array) || isNaN(tile[t.i])) return undefined;
   return tile[t.i];
@@ -326,6 +355,7 @@ function imuSample(x, y, z, dt) {
 
 // GPSを受信するたび：推定を終了し、学習用の記録を足す
 function imuOnGps(t, vKmh, acc) {
+  if (IMU.est) logEv({ t, e: 'est', sec: r1((t - IMU.est.since) / 1000), est: r1(IMU.est.v * 3.6), gps: r1(vKmh), model: !!IMU.model });
   IMU.est = null;
   const v = vKmh / 3.6, p = IMU.prevGps, last = IMU.hist[IMU.hist.length - 1];
   if (IMU.cnt) {
@@ -395,6 +425,17 @@ function imuMaybeStart() {
   }
 }
 
+function limitGrade(d) {
+  let p = null;
+  for (let i = 0; i < d.A.length; i++) {
+    const x = d.A[i];
+    if (x == null) continue;
+    if (p == null || d.B[i] || i === 0) { p = x; continue; }
+    const lim = (d.V[i] + d.V[i - 1]) / 2 / 3.6 * ((d.T[i] - d.T[i - 1]) / 1000) * MAX_GRADE;
+    p = Math.min(p + lim, Math.max(p - lim, p + (x - p) * 0.5));
+    d.A[i] = r1(p);
+  }
+}
 function recomputeGain(d) {
   let ref = null;
   d.gain = 0; d.loss = 0;
@@ -516,6 +557,7 @@ function updateRecBtn() {
 $('btnRec').onclick = () => rec ? stopRec() : startRec();
 
 document.addEventListener('visibilitychange', () => {
+  logEv({ t: Date.now(), e: document.visibilityState });
   if (document.visibilityState === 'visible' && rec) requestWake();
   if (document.visibilityState === 'hidden') save();
 });
@@ -673,6 +715,7 @@ async function fixElevation(m, btn) {
     for (const [i, pi] of idx) if (!isNaN(tile[pi])) { d.A[i] = r1(tile[pi]); fixed++; }
   }
   if (!fixed) { alert('標高データを取得できませんでした（電波を確認してください）'); showRecords(); return; }
+  limitGrade(d);
   recomputeGain(d);
   d.demFixed = true;
   await store.put(makeMeta(m.id, m.name, d), { id: m.id, d });
