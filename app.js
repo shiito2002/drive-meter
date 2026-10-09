@@ -40,12 +40,10 @@ let demo = null;          // デモ走行の生成関数
 let demoTimer = null;
 let watchId = null;
 let lastFix = 0, lastAcc = null, lastAltAcc = null, liveV = null;
-let altS = lastNonNull(D.A);   // 平滑化した高度
-let altSrc = null;              // 'dem'（国土地理院） / 'gps'
-let altT = 0;                   // 標高を最後に更新した時刻
-let demLastT = 0;               // 地理院の標高を最後に取れた時刻
-let altV = 0;                   // 標高を最後に更新したときの速度[km/h]
-const MAX_GRADE = 0.12;         // 道路の最大勾配（12%）。これより急な標高変化は地形の読み違いとみなす
+let altS = lastNonNull(D.A);   // 平滑化した高度（GPS）
+let altT = 0;                   // 高度を最後に更新した時刻
+let altV = 0;                   // 高度を最後に更新したときの速度[km/h]
+const MAX_GRADE = 0.12;         // 道路の最大勾配（12%）。これより急な高度変化はGPSのぶれとみなして抑える
 let warn = null;          // null / 'fast'（超過） / 'slow'（低下）
 let view = null;          // 見返し中の記録 { id, name, R, ci }
 let wakeLock = null, audioCtx = null, dirty = false;
@@ -106,53 +104,46 @@ function onPosition(pos) {
   if (demo && !pos.demo) return;           // デモ中は実GPSを無視
   const c = pos.coords;
   lastFix = Date.now(); lastAcc = c.accuracy; lastAltAcc = c.altitudeAccuracy ?? null;
-  const tun = rec && IMU.est && IMU.est.s != null && c.accuracy <= MAX_ACC ? IMU.est : null;   // 推定していたトンネル区間
 
   const t = pos.timestamp;
   const n0 = D.T.length, dt0 = n0 ? (t - D.T[n0 - 1]) / 1000 : 0;
 
   let v = (c.speed != null && !isNaN(c.speed)) ? c.speed * 3.6 : null;
-  if (v == null) v = (n0 && !tun && dt0 > 0 && dt0 <= GAP_SEC) ? hav(D.LAT[n0 - 1], D.LNG[n0 - 1], c.latitude, c.longitude) / dt0 * 3.6 : 0;
+  if (v == null) v = (n0 && dt0 > 0 && dt0 <= GAP_SEC) ? hav(D.LAT[n0 - 1], D.LNG[n0 - 1], c.latitude, c.longitude) / dt0 * 3.6 : 0;
   if (v < 1.5) v = 0;
+  // スマホがまったく揺れていない状態が続き、GPSの精度も悪いときは、速度のぶれとみなして 0km/h（屋内など）
+  if (v > 0 && c.accuracy > STILL_ACC && isStill()) v = 0;
   liveV = v;
   updateWarn(v);
   if (c.accuracy <= MAX_ACC) maybeQueryMuni(c.latitude, c.longitude, v);
-  if (!pos.demo) imuOnGps(t, v, c.accuracy);
   if (c.accuracy > MAX_ACC) { logBadAcc(t, c.accuracy); requestRender(); return; }
 
-  // 標高：国土地理院の標高タイルを優先し、取れないときはGPSの高度（＋補正値）。記録していないときも表示用に更新
-  const dem = demo ? undefined : demAt(c.latitude, c.longitude);
-  if (dem !== undefined) demLastT = t;
-  const holdDem = dem === undefined && altSrc === 'dem' && t - demLastT < 15000;   // 読み込み待ちの間は据え置き
-  const src = dem !== undefined ? 'dem' : 'gps';
-  const raw = dem !== undefined ? dem : c.altitude != null ? c.altitude + S.altOffset : null;
-  const switched = !holdDem && altSrc != null && src !== altSrc;
-  if (raw != null && !holdDem) {
-    const fresh = altS == null || switched || t - altT > GAP_SEC * 1000;
-    if (fresh) altS = raw;
+  // 高度：GPSの高度（＋補正値）を平滑化。道路の最大勾配を超える変化は抑える。記録していないときも表示用に更新
+  if (c.altitude != null) {
+    const raw = c.altitude + S.altOffset;
+    if (altS == null || t - altT > GAP_SEC * 1000) altS = raw;
     else {
       const lim = (altV + v) / 2 / 3.6 * ((t - altT) / 1000) * MAX_GRADE;   // その間に動いた距離 × 最大勾配
-      altS = Math.min(altS + lim, Math.max(altS - lim, altS + (raw - altS) * (src === 'dem' ? 0.5 : 0.15)));
+      altS = Math.min(altS + lim, Math.max(altS - lim, altS + (raw - altS) * 0.15));
     }
-    altSrc = src; altT = t; altV = v;
+    altT = t; altV = v;
   }
   const a = altS;
 
   if (!rec) { requestRender(); return; }
-  // トンネル等の推定区間を閉じる。条件に合わなければ推定した点を取り消して「途切れ」に戻す
-  const tunOk = tun ? tunnelOk(tun, c.latitude, c.longitude, t) : false;
-  if (tun && !tunOk) revertTunnel(tun);
-  const n = D.T.length, dt = n ? (t - D.T[n - 1]) / 1000 : 0, gap = !n || dt > GAP_SEC;
+  const n = D.T.length, dt = n ? (t - D.T[n - 1]) / 1000 : 0;
   if (n && dt <= 0) { requestRender(); return; }
 
-  if (!gap) {
+  let gap = !n || dt > GAP_SEC;
+  if (gap && n && fillGap(c.latitude, c.longitude, t, v, a)) gap = false;   // トンネル等の区間を補えた
+  else if (!gap) {
     D.recTime += dt;
     // 3秒以上あいたときは前後の速度ではなく、2点間の直線距離を足す（その間に止まっていた場合など）
     D.dist += dt > 3 ? hav(D.LAT[n - 1], D.LNG[n - 1], c.latitude, c.longitude) / 1000 : (D.V[n - 1] + v) / 2 * dt / 3600;
     if (v >= STOP_KMH) D.moving += dt;
   }
   if (a != null) {
-    if (D.altRef == null || gap || switched) D.altRef = a;   // 途切れ・取得元の切り替えでの段差は数えない
+    if (D.altRef == null || gap) D.altRef = a;   // 途切れでの段差は数えない
     const da = a - D.altRef;
     if (da >= ALT_STEP) { D.gain += da; D.altRef = a; }
     else if (da <= -ALT_STEP) { D.loss -= da; D.altRef = a; }
@@ -160,7 +151,6 @@ function onPosition(pos) {
 
   D.RT.push(r1(D.recTime)); D.T.push(t); D.V.push(r1(v)); D.A.push(a == null ? null : r1(a));
   D.LAT.push(r6(c.latitude)); D.LNG.push(r6(c.longitude)); D.B.push(gap ? 1 : 0); D.Q.push(Math.round(c.accuracy)); D.E.push(0);
-  if (tunOk) finishTunnel(tun, c.latitude, c.longitude, t, v);
   if (v > D.maxV) { D.maxV = v; D.maxI = D.V.length - 1; }
   const lastM = D.M[D.M.length - 1];
   if (muni.name && (!lastM || lastM.n !== muni.name)) D.M.push({ i: D.V.length - 1, n: muni.name });
@@ -170,54 +160,30 @@ function onPosition(pos) {
 }
 
 // ===================== トンネル等（GPSなし）の区間を記録で補う =====================
-// 推定中は1秒ごとに推定速度の点を記録に足していき（E=1、グラフは灰色の点線）、GPSが戻ったら
-// 入口〜出口の直線距離で距離を置き換え、位置と標高は入口と出口を直線で結ぶ。
+// 走行中にGPSが途切れ、戻ったときに「入口〜出口の直線距離 ÷ 時間」が5km/h以上なら、
+// その間を1秒ごとの点で埋める（E=1、グラフは灰色の点線）。速度は区間の平均、位置と高度は入口と出口を直線で結ぶ。
+// 推定区間は最高速度・平均速度に含めない（平均は tunKm を除いて計算）。
 const TUN_MAX_SEC = 600;          // これより長い途切れは補わない
-function appendEstSample() {
-  const E = IMU.est, n = D.T.length;
-  if (!E || !rec || demo || !n) return;
-  const t = Date.now(), dt = (t - D.T[n - 1]) / 1000;
-  if (dt < 0.5 || t - E.since > TUN_MAX_SEC * 1000) return;
-  if (E.s == null) { E.s = n; E.d0 = D.dist; }
-  const v = E.v * 3.6;
-  D.recTime += dt;
-  D.dist += (D.V[n - 1] + v) / 2 * dt / 3600;
-  D.RT.push(r1(D.recTime)); D.T.push(t); D.V.push(r1(v)); D.A.push(D.A[n - 1]);
-  D.LAT.push(D.LAT[n - 1]); D.LNG.push(D.LNG[n - 1]); D.B.push(0); D.Q.push(null); D.E.push(1);
-  dirty = true;
-}
-function tunnelOk(E, lat, lng, t) {
-  const p = E.s - 1;
-  if (p < 0 || E.s >= D.T.length) return false;
-  const sec = (t - D.T[p]) / 1000, km = hav(D.LAT[p], D.LNG[p], lat, lng) / 1000;
-  return sec <= TUN_MAX_SEC && km / (sec / 3600) >= STOP_KMH;
-}
-function revertTunnel(E) {           // 推定した点を取り消す（停車していた・離れた場所で戻った等）
-  const s = E.s;
-  if (s == null || s >= D.T.length) return;
-  for (const k of ['RT', 'T', 'V', 'A', 'LAT', 'LNG', 'B', 'Q', 'E']) D[k].length = s;
-  D.dist = E.d0; D.recTime = D.RT[s - 1] || 0;
-  E.s = null;
-}
-function finishTunnel(E, lat, lng, t, vKmh) {
-  const s = E.s, x = D.T.length - 1, p = s - 1;          // 推定点 s〜x-1、x が出口
-  const km = hav(D.LAT[p], D.LNG[p], lat, lng) / 1000;
-  D.dist += km - (D.dist - E.d0);                         // 推定から足した距離を直線距離に置き換え
-  D.tunKm += km;
-  const span = D.T[x] - D.T[p];
-  for (let i = s; i < x; i++) {
-    const f = (D.T[i] - D.T[p]) / span;
-    D.LAT[i] = r6(D.LAT[p] + (lat - D.LAT[p]) * f); D.LNG[i] = r6(D.LNG[p] + (lng - D.LNG[p]) * f);
-    if (D.A[p] != null && D.A[x] != null) D.A[i] = r1(D.A[p] + (D.A[x] - D.A[p]) * f);
+function fillGap(lat, lng, t, v, a) {
+  const p = D.T.length - 1, sec = (t - D.T[p]) / 1000;
+  const km = hav(D.LAT[p], D.LNG[p], lat, lng) / 1000, avg = km / (sec / 3600);
+  if (sec > TUN_MAX_SEC || D.V[p] < STOP_KMH || avg < STOP_KMH) return false;
+  const s = D.T.length;
+  for (let k = 1; k < sec; k++) {
+    const f = k / sec;
+    D.RT.push(r1(D.recTime + k)); D.T.push(D.T[p] + k * 1000); D.V.push(r1(avg));
+    D.A.push(D.A[p] != null && a != null ? r1(D.A[p] + (a - D.A[p]) * f) : D.A[p]);
+    D.LAT.push(r6(D.LAT[p] + (lat - D.LAT[p]) * f)); D.LNG.push(r6(D.LNG[p] + (lng - D.LNG[p]) * f));
+    D.B.push(0); D.Q.push(null); D.E.push(1);
   }
-  D.TN.push({ s, e: x, sec: Math.round(span / 1000), km: +km.toFixed(2), gps: r1(vKmh), est: r1(E.v * 3.6), model: !!IMU.model });
+  D.recTime += sec; D.dist += km; D.tunKm += km;
+  D.TN.push({ s, e: D.T.length, sec: Math.round(sec), km: +km.toFixed(2), avg: r1(avg) });
+  return true;
 }
 function tunnelAt(d, i) { return (d.TN || []).find(tn => i >= tn.s && i <= tn.e) || null; }
 function tunnelSummary(d) {
   const tn = d.TN || [];
-  if (!tn.length) return null;
-  const errs = tn.filter(x => x.model).map(x => Math.abs(x.est - x.gps));
-  return { n: tn.length, km: tn.reduce((a, x) => a + x.km, 0), err: errs.length ? errs.reduce((a, x) => a + x, 0) / errs.length : null };
+  return tn.length ? { n: tn.length, km: tn.reduce((a, x) => a + x.km, 0) } : null;
 }
 
 // ===================== 市町村（国土地理院 住所検索API） =====================
@@ -301,214 +267,27 @@ function muniAtIndex(d, i) {
   return name;
 }
 
-// ===================== 標高（国土地理院 標高タイル） =====================
-// 10mメッシュの標高PNGタイル（z14 ≒ 1.8km四方）。取得したタイルは端末に保存して電波がなくても使う
-const DEM_Z = 14;
-const demUrl = (x, y) => `https://cyberjapandata.gsi.go.jp/xyz/dem_png/${DEM_Z}/${x}/${y}.png`;
-const demTiles = new Map();   // "x/y" → Float32Array（標高[m]、なしはNaN） / null（タイルなし） / 'loading'
-function tileXY(lat, lng) {
-  const n = 2 ** DEM_Z, r = lat * Math.PI / 180;
-  const xf = (lng + 180) / 360 * n, yf = (1 - Math.log(Math.tan(r) + 1 / Math.cos(r)) / Math.PI) / 2 * n;
-  const x = Math.floor(xf), y = Math.floor(yf);
-  return { x, y, key: x + '/' + y, i: Math.min(255, Math.floor((yf - y) * 256)) * 256 + Math.min(255, Math.floor((xf - x) * 256)) };
-}
-async function loadDemTile(x, y) {
-  const key = x + '/' + y;
-  if (demTiles.has(key)) return demTiles.get(key);
-  demTiles.set(key, 'loading');
-  try {
-    const url = demUrl(x, y);
-    const cache = await caches.open('dem-tiles');
-    let res = await cache.match(url);
-    if (!res) {
-      res = await fetch(url);
-      if (res.status === 404) { demTiles.set(key, null); return null; }   // 海など
-      if (!res.ok) throw new Error(res.status);
-      await cache.put(url, res.clone());
-    }
-    const bmp = await createImageBitmap(await res.blob(), { colorSpaceConversion: 'none', premultiplyAlpha: 'none' });
-    const cv = new OffscreenCanvas(256, 256), ctx = cv.getContext('2d', { willReadFrequently: true });
-    ctx.drawImage(bmp, 0, 0);
-    const px = ctx.getImageData(0, 0, 256, 256).data, out = new Float32Array(65536);
-    for (let i = 0; i < 65536; i++) {
-      const v = px[i * 4] * 65536 + px[i * 4 + 1] * 256 + px[i * 4 + 2];
-      out[i] = v === 8388608 ? NaN : (v < 8388608 ? v : v - 16777216) * 0.01;
-    }
-    if (demTiles.size > 80) demTiles.delete(demTiles.keys().next().value);   // 古いものから捨てる
-    demTiles.set(key, out);
-    return out;
-  } catch {
-    setTimeout(() => demTiles.delete(key), 30000);   // 電波がないときは30秒後に再挑戦
-    return null;
-  }
-}
-const prefetchDem = (x, y) => { if (!demTiles.has(x + '/' + y)) loadDemTile(x, y); };
-// その地点の標高。まだタイルがなければ読み込みを始めて undefined
-function demAt(lat, lng) {
-  const t = tileXY(lat, lng), tile = demTiles.get(t.key);
-  // タイルの端（約250m以内）に近づいたら、隣のタイルを先に読み込んでおく
-  const px = t.i % 256, py = t.i >> 8, E = 36;
-  const dx = px < E ? -1 : px > 255 - E ? 1 : 0, dy = py < E ? -1 : py > 255 - E ? 1 : 0;
-  if (dx) prefetchDem(t.x + dx, t.y);
-  if (dy) prefetchDem(t.x, t.y + dy);
-  if (dx && dy) prefetchDem(t.x + dx, t.y + dy);
-  if (tile === undefined) { loadDemTile(t.x, t.y); return undefined; }
-  if (!(tile instanceof Float32Array) || isNaN(tile[t.i])) return undefined;
-  return tile[t.i];
-}
-// ===================== トンネル内の速度推定（加速度センサー） =====================
-// GPSが良い間に「端末の加速度ベクトル → 車の前後加速度」の対応を学習しておき、
-// GPSが途切れたら最後の速度から加速度を積分して推定する（推定中は灰色で表示）。
-// 実機で確かめたこと：スマホのGPS速度は加速度より2〜3秒遅れて変化し、1秒ごとの速度差はばらつきが大きい。
-// そこで「3秒間の速度差」と「遅れ分ずらした3秒間の平均加速度」を比べ、遅れ（0〜4秒）も自動で選ぶ。
-const IMU = {
-  hist: [],                     // GPS更新ごとの { t, v[m/s], m:[x,y,z] その間の平均加速度, ok }
-  model: null,                  // 学習結果 { u: 前方向（単位ベクトル）, s: 倍率, beta: 補正, lag: 遅れ[秒], corr: 相関 }
-  fit: { n: 0, corr: 0 },       // 直近の学習の状況（設定画面に表示）
-  lastFit: 0,
-  sum: [0, 0, 0], cnt: 0,       // GPS更新の間の加速度の合計
-  lastT: 0, prevGps: null,      // 前回のセンサー時刻 / 前回のGPS { t, v[m/s] }
-  lp: [0, 0, 0], vib: 0, vibStop: null, vibMove: null, still: 0,   // 細かい振動の大きさ（停車判定用）
-  est: null,                    // 推定中 { v[m/s], since[ms] }
-  events: 0,
-};
-const IMU_W = 3;                // 速度差を見る幅[秒]
-const IMU_MAXLAG = 4;           // 試すGPSの遅れ[秒]
-const IMU_MIN_PAIRS = 90;       // 学習に使う組の最低数（約1.5分ぶん）
-const IMU_MIN_CORR = 0.35;      // これ以上の相関があれば採用
-try {
-  const L = JSON.parse(localStorage.getItem('drv.imu'));
-  if (L && L.model) { IMU.model = L.model; IMU.fit = { n: L.model.n, corr: L.model.corr }; }
-  if (L) { IMU.vibStop = L.vibStop ?? null; IMU.vibMove = L.vibMove ?? null; }
-} catch {}
-function saveImu() {
-  if (!IMU.model && IMU.vibMove == null) return;
-  try { localStorage.setItem('drv.imu', JSON.stringify({ model: IMU.model, vibStop: IMU.vibStop, vibMove: IMU.vibMove })); } catch {}
-}
-
+// ===================== 静止判定（加速度センサー） =====================
+// 細かい振動（0.3秒より速い揺れ）の強さを見て、まったく揺れていない状態が続いているかを判定する。
+// 車内では走行中も停車中もエンジンや路面の振動があるため、これが続くのは机の上など車外に置いたときだけ。
+const STILL = { lp: [0, 0, 0], vib: null, since: 0, lastT: 0 };
+const STILL_VIB = 0.003;        // 振動の二乗平均[(m/s²)²]がこれ未満なら「揺れていない」
+const STILL_SEC = 3;            // これだけ続いたら静止とみなす[秒]
+const STILL_ACC = 20;           // GPSの精度[m]がこれより悪いときだけ 0km/h にする
 addEventListener('devicemotion', e => {
   const a = e.acceleration;     // 重力を除いた加速度（端末の座標系）
   if (!a || a.x == null) return;
-  const now = performance.now(), dt = IMU.lastT ? Math.min(0.2, (now - IMU.lastT) / 1000) : 0;
-  IMU.lastT = now; IMU.events++;
-  imuSample(a.x, a.y, a.z, dt);
+  const now = performance.now(), dt = STILL.lastT ? Math.min(0.2, (now - STILL.lastT) / 1000) : 0;
+  STILL.lastT = now;
+  const k = Math.min(1, dt / 0.3), lp = STILL.lp;
+  lp[0] += (a.x - lp[0]) * k; lp[1] += (a.y - lp[1]) * k; lp[2] += (a.z - lp[2]) * k;
+  const e2 = (a.x - lp[0]) ** 2 + (a.y - lp[1]) ** 2 + (a.z - lp[2]) ** 2;
+  STILL.vib = STILL.vib == null ? e2 : STILL.vib + (e2 - STILL.vib) * Math.min(1, dt);
+  if (STILL.vib < STILL_VIB) { if (!STILL.since) STILL.since = now; }
+  else STILL.since = 0;
 });
-
-const imuForward = (md, x, y, z) => md.s * (md.u[0] * x + md.u[1] * y + md.u[2] * z - md.beta);
-
-function imuSample(x, y, z, dt) {
-  IMU.sum[0] += x; IMU.sum[1] += y; IMU.sum[2] += z; IMU.cnt++;
-  // 細かい振動だけを見る（0.3秒より遅い加減速は除く）→ 約1秒の二乗平均
-  const k = Math.min(1, dt / 0.3), lp = IMU.lp;
-  lp[0] += (x - lp[0]) * k; lp[1] += (y - lp[1]) * k; lp[2] += (z - lp[2]) * k;
-  const hx = x - lp[0], hy = y - lp[1], hz = z - lp[2];
-  IMU.vib += (hx * hx + hy * hy + hz * hz - IMU.vib) * Math.min(1, dt);
-  const E = IMU.est;
-  if (!E || dt <= 0) return;
-  if (IMU.model) E.v = Math.min(70, Math.max(0, E.v + imuForward(IMU.model, x, y, z) * dt));
-  // 振動がほとんどない状態が続いたら停車とみなす（停車中と走行中の振動を学習済みのときだけ）
-  if (IMU.vibStop != null && IMU.vibMove != null && IMU.vibMove > IMU.vibStop * 3) {
-    const thr = Math.sqrt(IMU.vibStop * IMU.vibMove);
-    IMU.still = IMU.vib < thr ? IMU.still + dt : 0;
-    if (IMU.still > (E.v < 7 ? 2 : 5)) E.v = 0;          // 推定がまだ速いときは慎重に（5秒）
-  }
-}
-
-// GPSを受信するたび：推定を終了し、学習用の記録を足す
-function imuOnGps(t, vKmh, acc) {
-  if (IMU.est) logEv({ t, e: 'est', sec: r1((t - IMU.est.since) / 1000), est: r1(IMU.est.v * 3.6), gps: r1(vKmh), model: !!IMU.model });
-  IMU.est = null;
-  const v = vKmh / 3.6, p = IMU.prevGps, last = IMU.hist[IMU.hist.length - 1];
-  if (IMU.cnt) {
-    const ok = acc <= 20 && !!last && t - last.t >= 500 && t - last.t <= 2500;
-    IMU.hist.push({ t, v, m: IMU.sum.map(x => x / IMU.cnt), ok });
-    if (IMU.hist.length > 900) IMU.hist.shift();            // 直近15分ぶん
-    if (acc <= 20) {
-      if (v < 0.3 && p && p.v < 0.3) IMU.vibStop = IMU.vibStop == null ? IMU.vib : IMU.vibStop + (IMU.vib - IMU.vibStop) * 0.05;
-      if (v > 8) IMU.vibMove = IMU.vibMove == null ? IMU.vib : IMU.vibMove + (IMU.vib - IMU.vibMove) * 0.05;
-    }
-  }
-  IMU.sum = [0, 0, 0]; IMU.cnt = 0;
-  if (acc <= MAX_ACC) IMU.prevGps = { t, v };
-  if (t - IMU.lastFit > 20000) { IMU.lastFit = t; imuFit(); }
-}
-
-// 直近の記録から、遅れ 0〜4秒それぞれで「前方向・倍率・補正・相関」を求め、いちばん合うものを採用する
-function imuFit() {
-  const H = IMU.hist, W = IMU_W, mean = a => a.reduce((s, x) => s + x, 0) / a.length;
-  let best = null;
-  for (let lag = 0; lag <= IMU_MAXLAG; lag++) {
-    const A = [], Mw = [];
-    for (let i = W + lag; i < H.length; i++) {
-      let ok = H[i].v > 1.5;
-      for (let j = i - W - lag + 1; j <= i && ok; j++) ok = H[j].ok;
-      if (!ok) continue;
-      A.push((H[i].v - H[i - W].v) / ((H[i].t - H[i - W].t) / 1000));
-      const w = [0, 0, 0];
-      for (let j = i - W + 1 - lag; j <= i - lag; j++) for (let c = 0; c < 3; c++) w[c] += H[j].m[c] / W;
-      Mw.push(w);
-    }
-    if (A.length < 20) continue;
-    const ma = mean(A), va = mean(A.map(a => (a - ma) ** 2));
-    if (va < 0.005) continue;                                  // 加減速がほとんどない
-    const mm = [0, 1, 2].map(c => mean(Mw.map(w => w[c])));
-    const g = [0, 1, 2].map(c => mean(Mw.map((w, i) => (w[c] - mm[c]) * (A[i] - ma))) / va);
-    const gl = Math.hypot(...g);
-    if (!gl) continue;
-    const u = g.map(x => x / gl);
-    const P = Mw.map(w => u[0] * w[0] + u[1] * w[1] + u[2] * w[2]), mp = mean(P);
-    const vp = mean(P.map(x => (x - mp) ** 2)), cpa = mean(P.map((x, i) => (x - mp) * (A[i] - ma)));
-    const corr = cpa / Math.sqrt(vp * va);
-    if (!best || corr > best.corr) {
-      const s = Math.min(1.8, Math.max(0.7, cpa / vp));
-      best = { u, s, beta: mp - ma / s, lag, corr, n: A.length };
-    }
-  }
-  if (!best) return;
-  IMU.fit = { n: best.n, corr: best.corr };
-  if (best.n >= IMU_MIN_PAIRS && best.corr >= IMU_MIN_CORR) { IMU.model = best; saveImu(); }
-}
-
-// 走行中にGPSが2.5秒以上途切れたら推定を始める
-function imuMaybeStart() {
-  if (IMU.est || demo || watchId == null || !IMU.prevGps || !IMU.lastT) return;
-  const lost = Date.now() - lastFix;
-  if (lost > 2500 && IMU.prevGps.v * 3.6 >= STOP_KMH && performance.now() - IMU.lastT < 1000) {
-    let v = IMU.prevGps.v;
-    const md = IMU.model;
-    if (md) {
-      // GPS速度の遅れぶん（直前 lag 秒）と、途切れてからの2.5秒ぶんの加速度を足しておく
-      if (md.lag) for (const h of IMU.hist.slice(-md.lag)) v += imuForward(md, ...h.m);
-      if (IMU.cnt) v += imuForward(md, ...IMU.sum.map(x => x / IMU.cnt)) * lost / 1000;
-    }
-    IMU.est = { v: Math.max(0, v), since: lastFix };
-    IMU.still = 0;
-  }
-}
-
-function limitGrade(d) {
-  let p = null;
-  for (let i = 0; i < d.A.length; i++) {
-    const x = d.A[i];
-    if (x == null) continue;
-    if (p == null || d.B[i] || i === 0) { p = x; continue; }
-    const lim = (d.V[i] + d.V[i - 1]) / 2 / 3.6 * ((d.T[i] - d.T[i - 1]) / 1000) * MAX_GRADE;
-    p = Math.min(p + lim, Math.max(p - lim, p + (x - p) * 0.5));
-    d.A[i] = r1(p);
-  }
-}
-function recomputeGain(d) {
-  let ref = null;
-  d.gain = 0; d.loss = 0;
-  for (let i = 0; i < d.A.length; i++) {
-    const a = d.A[i];
-    if (a == null) continue;
-    if (ref == null || d.B[i]) { ref = a; continue; }
-    const da = a - ref;
-    if (da >= ALT_STEP) { d.gain += da; ref = a; }
-    else if (da <= -ALT_STEP) { d.loss -= da; ref = a; }
-  }
-}
+const isStill = () => STILL.since > 0 && performance.now() - STILL.lastT < 1000
+  && performance.now() - STILL.since > STILL_SEC * 1000;
 
 function updateGpsStatus() {
   const el = $('gps');
@@ -518,7 +297,6 @@ function updateGpsStatus() {
   }
   else if (!demo && watchId == null) txt = 'GPS オフ';
   else if (!lastFix) txt = 'GPS 測位中…';
-  else if (IMU.est) { cls = 'est'; txt = 'GPSなし・加速度で推定中'; }
   else if (Date.now() - lastFix > 5000) { cls = 'bad'; txt = 'GPS 受信なし'; }
   else {
     // 位置の精度（＋取れれば高度の精度）
@@ -529,11 +307,8 @@ function updateGpsStatus() {
   el.className = 'gps ' + cls; el.textContent = txt;
 }
 setInterval(() => {
-  imuMaybeStart();
-  appendEstSample();
   updateGpsStatus();
   if (liveV != null && Date.now() - lastFix > 5000) { liveV = null; warn = null; requestRender(); }
-  if (IMU.est) requestRender();
 }, 1000);
 
 // ===================== 警告・色 =====================
@@ -627,7 +402,6 @@ addEventListener('pagehide', save);
 
 // 記録中のドライブを端末に一時保存（アプリを閉じても続きから）
 function save() {
-  saveImu();
   if (demo || !dirty) return;
   try { localStorage.setItem('drv.session', JSON.stringify(D)); dirty = false; } catch {}
 }
@@ -689,7 +463,7 @@ function makeMeta(id, name, d) {
   const route = [];
   for (const m of d.M || []) if (route[route.length - 1] !== m.n) route.push(m.n);
   return { id, name, start: d.T[0], end: d.T[n - 1], dist: d.dist, recTime: d.recTime, maxV: d.maxV, sv, sa,
-           route, demFixed: !!d.demFixed, tun: tunnelSummary(d) };
+           route, tun: tunnelSummary(d) };
 }
 const defaultName = d => `${new Date(d.T[0]).getMonth() + 1}/${new Date(d.T[0]).getDate()} ${hhmm(d.T[0])} のドライブ`;
 const rangeLabel = (a, b) => `${ymd(a)} ${hhmm(a)} 〜 ${ymd(a) === ymd(b) ? '' : ymd(b) + ' '}${hhmm(b)}`;
@@ -759,38 +533,6 @@ async function exportGpx(m) {
     `drive_${fileStamp(m.start)}_${safeName(m.name)}.gpx`);
 }
 
-// 保存済みの記録の標高を、国土地理院の標高タイルで置き換える
-async function fixElevation(m, btn) {
-  const x = await store.load(m.id);
-  if (!x) return;
-  const d = x.d, groups = new Map();
-  for (let i = 0; i < d.V.length; i++) {          // 必要なタイルごとに記録点をまとめる
-    if (isEst(d, i)) continue;                     // トンネル内は地面（山）の標高になるので使わない
-    const t = tileXY(d.LAT[i], d.LNG[i]);
-    if (!groups.has(t.key)) groups.set(t.key, { t, idx: [] });
-    groups.get(t.key).idx.push([i, t.i]);
-  }
-  let k = 0, fixed = 0;
-  for (const { t, idx } of groups.values()) {
-    btn.textContent = `補正中 ${++k}/${groups.size}`;
-    let tile = await loadDemTile(t.x, t.y);
-    if (tile === 'loading') { await new Promise(r => setTimeout(r, 500)); tile = demTiles.get(t.key); }
-    if (!(tile instanceof Float32Array)) continue;
-    for (const [i, pi] of idx) if (!isNaN(tile[pi])) { d.A[i] = r1(tile[pi]); fixed++; }
-  }
-  if (!fixed) { alert('標高データを取得できませんでした（電波を確認してください）'); showRecords(); return; }
-  for (const tn of d.TN || []) {                   // トンネル内は入口と出口を直線で結ぶ
-    const p = tn.s - 1, x = tn.e;
-    if (p < 0 || d.A[p] == null || d.A[x] == null) continue;
-    for (let i = tn.s; i < x; i++) d.A[i] = r1(d.A[p] + (d.A[x] - d.A[p]) * (d.T[i] - d.T[p]) / (d.T[x] - d.T[p]));
-  }
-  limitGrade(d);
-  recomputeGain(d);
-  d.demFixed = true;
-  await store.put(makeMeta(m.id, m.name, d), { id: m.id, d });
-  alert(`${fixed} / ${d.V.length} 地点の標高を国土地理院のデータに置き換えました`);
-  showRecords();
-}
 const fileStamp = ts => { const d = new Date(ts); return `${d.getFullYear()}${p2(d.getMonth() + 1)}${p2(d.getDate())}_${p2(d.getHours())}${p2(d.getMinutes())}`; };
 const safeName = s => s.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 40);
 
@@ -836,13 +578,11 @@ async function showRecords() {
     const route = m.route && m.route.length ? `<div class="route">📍 ${m.route.map(esc).join(' → ')}</div>` : '';
     el.innerHTML = `<div class="n">${esc(m.name)}</div><div class="d">${rangeLabel(m.start, m.end)}</div>
       <div class="s">${statsLine(m.dist, m.recTime, m.maxV)}</div>
-      ${m.tun ? `<div class="tun">🚇 うちGPSなし ${m.tun.n}区間・${m.tun.km.toFixed(1)}km${m.tun.err != null ? `（出口での推定の誤差 平均±${m.tun.err.toFixed(0)}km/h）` : ''}</div>` : ''}
+      ${m.tun ? `<div class="tun">🚇 うちGPSなし ${m.tun.n}区間・${m.tun.km.toFixed(1)}km</div>` : ''}
       ${route}<canvas></canvas>
       <div class="a"><button class="btn" data-act="open">開く</button><button class="btn" data-act="rename">名前変更</button>
       <button class="btn" data-act="gpx">GPX</button><button class="btn" data-act="export">バックアップ</button>
-      ${m.demFixed ? '' : '<button class="btn" data-act="dem">標高補正</button>'}
-      <button class="btn dan" data-act="del">削除</button></div>
-      ${m.demFixed ? '<div class="d">標高：国土地理院のデータに補正済み</div>' : ''}`;
+      <button class="btn dan" data-act="del">削除</button></div>`;
     box.appendChild(el);
     el._meta = m;
   }
@@ -862,10 +602,6 @@ $('recList').addEventListener('click', async e => {
     showRecords();
   } else if (b.dataset.act === 'gpx') {
     exportGpx(m);
-  } else if (b.dataset.act === 'dem') {
-    if (b.disabled) return;
-    b.disabled = true;
-    try { await fixElevation(m, b); } catch { alert('標高の補正に失敗しました'); showRecords(); }
   } else if (b.dataset.act === 'export') {
     exportDrives([m.id], `drive-meter_${fileStamp(m.start)}_${safeName(m.name)}.json`);
   } else if (b.dataset.act === 'del') {
@@ -1009,24 +745,21 @@ function render() {
   const ci = view ? view.ci : R.V.length - 1;
 
   // --- 速度表示 ---
-  const est = !view && IMU.est ? IMU.est.v * 3.6 : null;   // トンネル内などの推定値
-  const viewEst = view && isEst(R, ci);
-  const v = view ? R.V[ci] : est != null ? est : liveV;
-  const w = view ? (viewEst ? null : warnOf(v)) : est != null ? null : warn;
+  const viewEst = view && isEst(R, ci);   // 見返しでトンネル等（GPSなし）の区間を選んでいる
+  const v = view ? R.V[ci] : liveV;
+  const w = view ? (viewEst ? null : warnOf(v)) : warn;
   $('speed').textContent = v == null ? '--' : Math.round(v);
   updateGpsStatus();
-  $('speedbox').classList.toggle('estimating', est != null || viewEst);
+  $('speedbox').classList.toggle('estimating', viewEst);
   const tnv = view ? tunnelAt(R, ci) : null;
   $('tunTip').hidden = !tnv;
-  if (tnv) $('tunTip').textContent = `🚇 GPSなし ${tnv.sec}秒・${tnv.km.toFixed(1)}km　出口で GPS ${Math.round(tnv.gps)} / 推定 ${Math.round(tnv.est)} km/h`
-    + (tnv.model ? `（差 ${tnv.est - tnv.gps >= 0 ? '+' : ''}${Math.round(tnv.est - tnv.gps)}）` : '（学習前のため速度を保持）');
+  if (tnv) $('tunTip').textContent = `🚇 GPSなし ${tnv.sec}秒・${tnv.km.toFixed(1)}km（平均 ${Math.round(tnv.km / (tnv.sec / 3600))} km/h）`;
   $('speedbox').classList.toggle('warn-fast', w === 'fast' && v != null);
   $('speedbox').classList.toggle('warn-slow', w === 'slow' && v != null);
   $('dTarget').textContent = S.target;
   $('dTol').textContent = S.tol;
   $('dDiff').textContent = v == null ? ''
-    : est != null ? `　推定 ${fmtMS((Date.now() - IMU.est.since) / 1000)}${IMU.model ? '' : '（学習前のため速度を保持）'}`
-    : viewEst ? '　推定（GPSなし）'
+    : viewEst ? '　GPSなしの区間（平均）'
     : `　差 ${v - S.target >= 0 ? '+' : ''}${Math.round(v - S.target)}`;
 
   // --- 速度バー（設定速度 ± barHalf の範囲を拡大） ---
@@ -1038,7 +771,7 @@ function render() {
     const pv = P(v);
     fill.style.left = Math.min(50, pv) + '%';
     fill.style.width = Math.abs(pv - 50) + '%';
-    fill.style.background = est != null || viewEst ? '#8a94a8' : colorFor(v);
+    fill.style.background = viewEst ? '#8a94a8' : colorFor(v);
     fill.style.borderRadius = pv < 50 ? '8px 0 0 8px' : '0 8px 8px 0';
   }
   $('band').style.left = P(S.target - S.tol) + '%';
@@ -1055,13 +788,11 @@ function render() {
 
   // --- 統計（数字は大きく、単位は小さく） ---
   setStat('sMax', has ? Math.round(R.maxV) : null, 'km/h');
-  const openKm = !view && IMU.est && IMU.est.s != null ? D.dist - IMU.est.d0 : 0;   // 推定中の区間の距離
-  setStat('sAvg', R.moving > 0 ? Math.round((R.dist - (R.tunKm || 0) - openKm) / (R.moving / 3600)) : null, 'km/h');   // 推定区間は含めない
+  setStat('sAvg', R.moving > 0 ? Math.round((R.dist - (R.tunKm || 0)) / (R.moving / 3600)) : null, 'km/h');   // GPSなしの区間は含めない
   setStat('sDist', has ? fmtDist(R.dist) : null, 'km');
   setStat('sTime', has ? fmtTime(R.recTime) : null, '');
   const alt = view ? R.A[ci] : altS;
-  const srcLbl = view ? (R.demFixed ? '地理院' : '') : altSrc === 'dem' ? '地理院' : altSrc === 'gps' ? 'GPS' : '';
-  $('sAltLbl').innerHTML = (view ? 'この地点の標高' : '現在標高') + (srcLbl ? `<em class="src">${srcLbl}</em>` : '');
+  $('sAltLbl').textContent = view ? 'この地点の高度' : '現在高度';
   setStat('sAlt', alt == null ? null : Math.round(alt), 'm');
   setStat('sGain', has ? Math.round(R.gain) : null, 'm');
 
@@ -1196,10 +927,8 @@ function drawChart(cv, src, x0, x1, o) {
 
   drawBand();
 
-  // GPSなし（推定）の区間に薄い帯（推定中の区間も）
-  const tns = [...(src.TN || [])];
-  if (src === D && IMU.est && IMU.est.s != null && IMU.est.s < D.RT.length) tns.push({ s: IMU.est.s, e: D.RT.length - 1 });
-  for (const tn of tns) {
+  // GPSなしの区間に薄い帯
+  for (const tn of src.TN || []) {
     if (tn.e >= src.RT.length) continue;
     const a = X(src.RT[Math.max(0, tn.s - 1)]), b = X(src.RT[tn.e]);
     if (b < pad.l || a > pad.l + w) continue;
@@ -1342,10 +1071,7 @@ function syncForm() {
     ch.querySelectorAll('button').forEach(b => b.classList.toggle('sel', +b.textContent === v));
   });
   $('btnDemo').textContent = demo ? 'デモ走行を終了' : 'デモ走行を開始';
-  const imu = !IMU.events ? '加速度センサー：未検出'
-    : IMU.model ? `加速度センサー：学習済み（相関 ${IMU.model.corr.toFixed(2)}・GPSの遅れ ${IMU.model.lag}秒）`
-    : `加速度センサー：学習中（データ ${Math.min(IMU.fit.n, IMU_MIN_PAIRS)}/${IMU_MIN_PAIRS}・相関 ${IMU.fit.corr.toFixed(2)}）`;
-  $('info').textContent = `記録点数 ${D.V.length}　/　データ量 約${Math.round(JSON.stringify(D).length / 1024)}KB　/　${imu}`;
+  $('info').textContent = `記録点数 ${D.V.length}　/　データ量 約${Math.round(JSON.stringify(D).length / 1024)}KB`;
 }
 function onField(id) {
   const key = FIELDS[id], v = parseFloat($(id).value);
@@ -1383,11 +1109,43 @@ $('btnReset').onclick = () => {
   resetSession(); syncForm();
 };
 
+// ===================== 起動時の確認 =====================
+// 前回の記録が残っていたら、リセットして新しく始めるか、続きから記録するかを聞く
+function askResetOnStart() {
+  let wasRec = false;
+  try { wasRec = localStorage.getItem('drv.rec') === '1'; } catch {}
+  if (!D.V.length) { if (wasRec) startRec(); return; }
+  const last = D.T[D.T.length - 1];
+  $('resumeInfo').textContent = `${fmtDist(D.dist)} km ／ ${fmtTime(D.recTime)} ／ 最後の記録 ${ymd(last)} ${hhmm(last)}`
+    + (!D.id ? '（未保存）' : unsaved() ? `（「${D.name}」の続きが未保存）` : `（「${D.name}」として保存済み）`);
+  $('btnResumeSave').hidden = !unsaved();
+  const dlg = $('resumeDlg');
+  const done = act => {
+    dlg.close();
+    if (act === 'continue') { if (wasRec) startRec(); return; }
+    setRecFlag(false);
+    resetSession();
+  };
+  $('btnResumeReset').onclick = () => done('reset');
+  $('btnResumeContinue').onclick = () => done('continue');
+  $('btnResumeSave').onclick = async () => {
+    D.id = D.id || 'd' + Date.now();
+    D.name = D.name || defaultName(D);
+    D.savedLen = D.V.length;
+    try { await store.put(makeMeta(D.id, D.name, D), { id: D.id, d: JSON.parse(JSON.stringify(D)) }); }
+    catch { alert('保存できませんでした'); return; }
+    done('reset');
+  };
+  dlg.oncancel = e => { e.preventDefault(); done('continue'); };    // 戻る操作は「続きから」
+  dlg.showModal();
+}
+
 // ===================== 起動 =====================
 startRenderLoop();
 applyLayout();
 updateRecBtn();
-try { if (localStorage.getItem('drv.rec') === '1') startRec(); } catch {}   // 記録中に閉じた／再読み込みした
+try { localStorage.removeItem('drv.imu'); caches.delete('dem-tiles'); } catch {}   // 以前の版のデータを片付け
+askResetOnStart();
 // すでに位置情報が許可されていれば、記録前から速度を表示
 navigator.permissions?.query({ name: 'geolocation' }).then(p => { if (p.state === 'granted') startGps(); }).catch(() => {});
 if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {

@@ -28,7 +28,6 @@ body.reviewing #btnRec,body.reviewing #btnRecords{display:none}
 .gps.fair{background:#fbbf2422;color:var(--gold)}
 .gps.bad{background:#ef444422;color:var(--red)}
 .gps.demo,.gps.view{background:#a78bfa22;color:var(--alt)}
-.gps.est{background:#8a94a833;color:#cbd5e1}
 .icon{width:44px;height:44px;flex:none;border-radius:12px;border:1px solid var(--line);background:var(--panel);font-size:20px;line-height:1}
 .icon.on{background:var(--red);border-color:var(--red);color:#fff}
 
@@ -98,8 +97,6 @@ body.reviewing #btnRec,body.reviewing #btnRecords{display:none}
 .portrait .tuntip{order:1;margin:4px 10px 0}
 .item .tun{font-size:12px;color:#cbd5e1;margin-top:2px}
 
-/* 標高の取得元（地理院／GPS） */
-.stat span em.src{font-style:normal;color:var(--accent);margin-left:6px}
 
 /* ===== 横画面 ===== */
 .app.landscape{display:grid;grid-template-columns:38% 62%;grid-template-rows:62% 38%}
@@ -194,3 +191,6 @@ dialog.full{width:100%;height:100%;max-width:none;max-height:none;border:0;borde
 .dlg .chk{display:flex;align-items:center;gap:8px;font-size:14px;margin:12px 0 0}
 .dlg .chk[hidden]{display:none}
 .dlg .bt{display:flex;gap:10px;justify-content:flex-end;margin-top:16px}
+.dlg .bt.col{flex-direction:column;align-items:stretch}
+.dlg .bt.col .btn{padding:12px 14px;font-size:15px}
+.dlg .bt .btn[hidden]{display:none}

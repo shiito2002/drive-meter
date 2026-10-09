@@ -43,7 +43,7 @@
       <div class="stat"><span>平均（走行中）</span><b id="sAvg">--</b></div>
       <div class="stat"><span>走行距離</span><b id="sDist">--</b></div>
       <div class="stat"><span>記録時間</span><b id="sTime">--</b></div>
-      <div class="stat"><span id="sAltLbl">現在標高</span><b id="sAlt">--</b></div>
+      <div class="stat"><span id="sAltLbl">現在高度</span><b id="sAlt">--</b></div>
       <div class="stat"><span>累積上昇</span><b id="sGain">--</b></div>
     </div>
   </section>
@@ -76,6 +76,20 @@
     </div>
   </div>
   <input id="fileIn" type="file" accept=".json,application/json" hidden>
+</dialog>
+
+<!-- 起動時：前回の記録をどうするか -->
+<dialog id="resumeDlg">
+  <div class="dlg">
+    <h3>前回の記録が残っています</h3>
+    <p id="resumeInfo" class="info" style="margin-top:0"></p>
+    <p class="info">リセットして新しいドライブを始めますか？</p>
+    <div class="bt col">
+      <button type="button" id="btnResumeReset" class="btn pri">リセットして新しく始める</button>
+      <button type="button" id="btnResumeSave" class="btn">保存してからリセット</button>
+      <button type="button" id="btnResumeContinue" class="btn">続きから記録する</button>
+    </div>
+  </div>
 </dialog>
 
 <!-- 名前の入力（保存・名前変更） -->
@@ -148,7 +162,7 @@
     </div>
 
     <div class="field">
-      <label for="fAltOff">GPS高度の補正値（標高データが取れないときだけ使用。GPS高度は海抜より30〜40m高く出ることが多いため）</label>
+      <label for="fAltOff">高度の補正値（GPS高度は海抜より30〜40m高く出ることが多いため）</label>
       <div class="num"><input id="fAltOff" type="number" inputmode="numeric" min="-100" max="100" step="1"><span>m</span></div>
     </div>
 
@@ -157,7 +171,7 @@
       <button type="button" id="btnReset" class="danger">記録をリセット</button>
     </div>
     <p id="info" class="info"></p>
-    <p class="info">標高・市町村：国土地理院（標高タイル・住所検索API）。位置情報はこれらの取得のためだけに国土地理院へ送られます。</p>
+    <p class="info">市町村：国土地理院（住所検索API）。位置情報は市町村の取得のためだけに国土地理院へ送られます。</p>
     <button class="close" value="close">閉じる</button>
   </form>
 </dialog>
