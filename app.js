@@ -1,5 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
+const APP_VERSION = 'v13（2026-10-10）';   // sw.js の CACHE 名と番号をそろえる
 const app = $('app');
 
 // ===================== 設定 =====================
@@ -40,6 +41,10 @@ let demo = null;          // デモ走行の生成関数
 let demoTimer = null;
 let watchId = null;
 let lastFix = 0, lastAcc = null, lastAltAcc = null, liveV = null;
+let lastRaw = null;             // 直前に受け取った測位 { t, v[km/h], lat, lng }（記録していないときも使う）
+let decay = null;               // GPS電波が弱まり速度が減衰しているとみなして表示を保持中 { held, since, acc0 }
+const DECAY_KMH_PER_S = 14.4;   // 1秒でこれ以上落ちたら（4m/s²超）減衰を疑う
+const DECAY_MAX_MS = 10000;     // 保持する最長時間
 let altS = lastNonNull(D.A);   // 平滑化した高度（GPS）
 let altT = 0;                   // 高度を最後に更新した時刻
 let altV = 0;                   // 高度を最後に更新したときの速度[km/h]
@@ -106,15 +111,28 @@ function onPosition(pos) {
   lastFix = Date.now(); lastAcc = c.accuracy; lastAltAcc = c.altitudeAccuracy ?? null;
 
   const t = pos.timestamp;
-  const n0 = D.T.length, dt0 = n0 ? (t - D.T[n0 - 1]) / 1000 : 0;
+  const pr = lastRaw, dtr = pr ? (t - pr.t) / 1000 : 0;
 
   let v = (c.speed != null && !isNaN(c.speed)) ? c.speed * 3.6 : null;
-  if (v == null) v = (n0 && dt0 > 0 && dt0 <= GAP_SEC) ? hav(D.LAT[n0 - 1], D.LNG[n0 - 1], c.latitude, c.longitude) / dt0 * 3.6 : 0;
+  if (v == null) {
+    // 速度が付いていない測位：0.8秒以上あいていれば位置の差から求め、それより短い（同じ位置の重複など）なら直前の速度のまま
+    v = !pr || dtr <= 0 || dtr > GAP_SEC ? 0 : dtr >= 0.8 ? hav(pr.lat, pr.lng, c.latitude, c.longitude) / dtr * 3.6 : pr.v;
+  }
   if (v < 1.5) v = 0;
   // スマホがまったく揺れていない状態が続き、GPSの精度も悪いときは、速度のぶれとみなして 0km/h（屋内など）
   if (v > 0 && c.accuracy > STILL_ACC && isStill()) v = 0;
-  liveV = v;
-  updateWarn(v);
+  lastRaw = { t, v, lat: c.latitude, lng: c.longitude };
+
+  // 高架下などで一瞬GPS電波が弱まると、スマホは速度をなめらかに減衰させて補う（実走で確認）。
+  // 1秒で14km/h以上落ちたら表示は直前の速度を灰色で保ち、元の速度に戻る・精度が悪くならない（本当の減速）・10秒で解除
+  if (!decay && pr && pr.v >= 30 && dtr > 0 && dtr <= 1.5 && (pr.v - v) / dtr >= DECAY_KMH_PER_S) {
+    decay = { held: pr.v, since: t, acc0: c.accuracy };
+  } else if (decay && (v >= decay.held * 0.85 || t - decay.since > DECAY_MAX_MS
+             || (t - decay.since >= 2500 && c.accuracy <= decay.acc0))) {
+    decay = null;
+  }
+  liveV = decay ? decay.held : v;
+  updateWarn(liveV);
   if (c.accuracy <= MAX_ACC) maybeQueryMuni(c.latitude, c.longitude, v);
   if (c.accuracy > MAX_ACC) { logBadAcc(t, c.accuracy); requestRender(); return; }
 
@@ -154,9 +172,37 @@ function onPosition(pos) {
   if (v > D.maxV) { D.maxV = v; D.maxI = D.V.length - 1; }
   const lastM = D.M[D.M.length - 1];
   if (muni.name && (!lastM || lastM.n !== muni.name)) D.M.push({ i: D.V.length - 1, n: muni.name });
+  if (!gap && n && dt <= 2.5) {
+    const posKmh = hav(D.LAT[n - 1], D.LNG[n - 1], c.latitude, c.longitude) / dt * 3.6;
+    if (posKmh > Math.max(v * 2, v + 30)) repairDecay(D.V.length - 1);
+  }
 
   dirty = true;
   requestRender();
+}
+
+// ===================== 一瞬の電波低下で減衰した速度を記録で直す =====================
+// x：電波が戻った点。その直前で、戻った後の速度の75%未満に落ちていた区間（2〜15点）を、
+// 落ちる前の点と x を結ぶ直線に置き換え（E=1）、距離も直線距離に直す。
+function repairDecay(x) {
+  const lim = D.V[x] * 0.75;
+  let s = x - 1;
+  while (s > 0 && x - s < 16 && D.V[s] < lim && !D.B[s] && !D.E[s]) s--;
+  if (x - s < 3 || D.V[s] < lim || D.B[s + 1]) return;      // 落ちていた区間が短すぎる・長すぎる・途切れをまたぐ
+  let added = 0;                                           // その区間でこれまでに足した距離
+  for (let i = s + 1; i <= x; i++) {
+    const dt = (D.T[i] - D.T[i - 1]) / 1000;
+    added += dt > 3 ? hav(D.LAT[i - 1], D.LNG[i - 1], D.LAT[i], D.LNG[i]) / 1000 : (D.V[i - 1] + D.V[i]) / 2 * dt / 3600;
+  }
+  const span = D.T[x] - D.T[s];
+  for (let i = s + 1; i < x; i++) {
+    const f = (D.T[i] - D.T[s]) / span;
+    D.V[i] = r1(D.V[s] + (D.V[x] - D.V[s]) * f);
+    D.LAT[i] = r6(D.LAT[s] + (D.LAT[x] - D.LAT[s]) * f); D.LNG[i] = r6(D.LNG[s] + (D.LNG[x] - D.LNG[s]) * f);
+    D.E[i] = 1;
+  }
+  D.dist += hav(D.LAT[s], D.LNG[s], D.LAT[x], D.LNG[x]) / 1000 - added;
+  logEv({ t: D.T[x], e: 'decay', sec: r1(span / 1000), from: D.V[s], to: D.V[x] });
 }
 
 // ===================== トンネル等（GPSなし）の区間を記録で補う =====================
@@ -747,10 +793,14 @@ function render() {
   // --- 速度表示 ---
   const viewEst = view && isEst(R, ci);   // 見返しでトンネル等（GPSなし）の区間を選んでいる
   const v = view ? R.V[ci] : liveV;
-  const w = view ? (viewEst ? null : warnOf(v)) : warn;
-  $('speed').textContent = v == null ? '--' : Math.round(v);
+  const held = !view && decay != null;     // 電波が弱まり直前の速度を保持中
+  const w = view ? (viewEst ? null : warnOf(v)) : held ? null : warn;
+  // 速度は小数点以下1桁まで（整数部は大きく、小数部は小さく）
+  const vt = v == null ? null : v.toFixed(1).split('.');
+  $('speed').textContent = vt ? vt[0] : '--';
+  $('speedDec').textContent = vt ? '.' + vt[1] : '';
   updateGpsStatus();
-  $('speedbox').classList.toggle('estimating', viewEst);
+  $('speedbox').classList.toggle('estimating', viewEst || held);
   const tnv = view ? tunnelAt(R, ci) : null;
   $('tunTip').hidden = !tnv;
   if (tnv) $('tunTip').textContent = `🚇 GPSなし ${tnv.sec}秒・${tnv.km.toFixed(1)}km（平均 ${Math.round(tnv.km / (tnv.sec / 3600))} km/h）`;
@@ -759,7 +809,8 @@ function render() {
   $('dTarget').textContent = S.target;
   $('dTol').textContent = S.tol;
   $('dDiff').textContent = v == null ? ''
-    : viewEst ? '　GPSなしの区間（平均）'
+    : held ? '　GPSが弱いため直前の速度'
+    : viewEst ? (tnv ? '　GPSなしの区間（平均）' : '　GPSが弱い区間（前後を補間）')
     : `　差 ${v - S.target >= 0 ? '+' : ''}${Math.round(v - S.target)}`;
 
   // --- 速度バー（設定速度 ± barHalf の範囲を拡大） ---
@@ -771,7 +822,7 @@ function render() {
     const pv = P(v);
     fill.style.left = Math.min(50, pv) + '%';
     fill.style.width = Math.abs(pv - 50) + '%';
-    fill.style.background = viewEst ? '#8a94a8' : colorFor(v);
+    fill.style.background = viewEst || held ? '#8a94a8' : colorFor(v);
     fill.style.borderRadius = pv < 50 ? '8px 0 0 8px' : '0 8px 8px 0';
   }
   $('band').style.left = P(S.target - S.tol) + '%';
@@ -1071,6 +1122,7 @@ function syncForm() {
     ch.querySelectorAll('button').forEach(b => b.classList.toggle('sel', +b.textContent === v));
   });
   $('btnDemo').textContent = demo ? 'デモ走行を終了' : 'デモ走行を開始';
+  $('appVersion').textContent = `バージョン ${APP_VERSION}`;
   $('info').textContent = `記録点数 ${D.V.length}　/　データ量 約${Math.round(JSON.stringify(D).length / 1024)}KB`;
 }
 function onField(id) {

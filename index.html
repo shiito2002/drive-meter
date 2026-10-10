@@ -23,7 +23,7 @@
     </div>
     <!-- 左半分をタップで設定速度 −10、右半分で +10 -->
     <div id="speedbox" class="speedbox">
-      <div class="speed"><span id="speed">--</span><small>km/h</small></div>
+      <div class="speed"><span id="speed">--</span><span id="speedDec" class="dec"></span><small>km/h</small></div>
       <div class="delta">設定 <b id="dTarget">60</b> ±<span id="dTol">10</span> km/h<span id="dDiff"></span></div>
       <div id="toast" class="toast"></div>
     </div>
@@ -110,7 +110,8 @@
 <!-- 設定 -->
 <dialog id="settings">
   <form method="dialog" class="set">
-    <h2>設定</h2>
+    <div class="set-head"><h2>設定</h2><button class="x" value="close" aria-label="閉じる">✕</button></div>
+    <div class="set-body">
 
     <div class="field">
       <label for="fTarget">設定速度（速度表示の左側タップで −10、右側タップで ＋10）</label>
@@ -170,9 +171,14 @@
       <button type="button" id="btnDemo" class="sec">デモ走行を開始</button>
       <button type="button" id="btnReset" class="danger">記録をリセット</button>
     </div>
-    <p id="info" class="info"></p>
-    <p class="info">市町村：国土地理院（住所検索API）。位置情報は市町村の取得のためだけに国土地理院へ送られます。</p>
-    <button class="close" value="close">閉じる</button>
+    <div class="about">
+      <div><b>ドライブ速度計</b>　<span id="appVersion"></span></div>
+      <div>作成者：shiito ・ Claude（Anthropic）</div>
+      <p id="info" class="info"></p>
+      <p class="info">市町村：国土地理院（住所検索API）。位置情報は市町村の取得のためだけに国土地理院へ送られます。</p>
+    </div>
+    </div>
+    <div class="set-foot"><button class="close" value="close">閉じる</button></div>
   </form>
 </dialog>
 
