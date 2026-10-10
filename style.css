@@ -30,6 +30,11 @@ body.reviewing #btnRec,body.reviewing #btnRecords{display:none}
 .gps.demo,.gps.view{background:#a78bfa22;color:var(--alt)}
 .icon{width:44px;height:44px;flex:none;border-radius:12px;border:1px solid var(--line);background:var(--panel);font-size:20px;line-height:1}
 .icon.on{background:var(--red);border-color:var(--red);color:#fff}
+.icon svg{width:22px;height:22px;display:block;margin:auto}
+.icon[hidden]{display:none}
+#btnPip.on{background:#34d39933;border-color:var(--accent);color:var(--accent)}
+/* 小窓用の動画（画面には出さない） */
+.pipvideo{position:fixed;left:0;bottom:0;width:2px;height:2px;opacity:0;pointer-events:none}
 
 .speedbox{position:relative;border-radius:14px;padding:2px 12px 6px;border:2px solid transparent;transition:border-color .2s,background .2s;cursor:pointer}
 .speedbox.warn-fast{border-color:var(--red);background:#ef444418;animation:blink-r 1s infinite}

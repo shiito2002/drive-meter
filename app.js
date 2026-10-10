@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const APP_VERSION = 'v13（2026-10-10）';   // sw.js の CACHE 名と番号をそろえる
+const APP_VERSION = 'v14（2026-10-10）';   // sw.js の CACHE 名と番号をそろえる
 const app = $('app');
 
 // ===================== 設定 =====================
@@ -1161,6 +1161,73 @@ $('btnReset').onclick = () => {
   resetSession(); syncForm();
 };
 
+// ===================== 小窓（ピクチャーインピクチャー） =====================
+// 速度などをキャンバスに描いて動画にし、小窓で表示する（Spotifyの歌詞などを見ながら使う）。
+// 小窓の間はページが裏に回るが、Pixel 9a でタイマーと描画は動き続けることを確認済み。
+// GPSが届かなくなったら小窓に「GPS停止中」と出す。
+const pip = { cv: null, ctx: null, video: null, timer: null };
+function pipSetup() {
+  if (!document.pictureInPictureEnabled || !HTMLCanvasElement.prototype.captureStream) return;   // 対応していなければボタンを出さない
+  pip.cv = document.createElement('canvas');
+  pip.cv.width = 640; pip.cv.height = 360;
+  pip.ctx = pip.cv.getContext('2d');
+  pip.video = document.createElement('video');
+  pip.video.muted = true; pip.video.playsInline = true; pip.video.className = 'pipvideo';
+  document.body.appendChild(pip.video);
+  pip.video.srcObject = pip.cv.captureStream(4);
+  pip.video.addEventListener('enterpictureinpicture', () => {
+    $('btnPip').classList.add('on'); logEv({ t: Date.now(), e: 'pip', on: 1 });
+  });
+  pip.video.addEventListener('leavepictureinpicture', () => {
+    $('btnPip').classList.remove('on'); logEv({ t: Date.now(), e: 'pip', on: 0 });
+    clearInterval(pip.timer); pip.timer = null;
+  });
+  $('btnPip').hidden = false;
+  $('btnPip').onclick = togglePip;
+}
+async function togglePip() {
+  if (document.pictureInPictureElement) { document.exitPictureInPicture().catch(() => {}); return; }
+  drawPip();
+  clearInterval(pip.timer);
+  pip.timer = setInterval(drawPip, 500);
+  try { await pip.video.play(); await pip.video.requestPictureInPicture(); }
+  catch (e) { clearInterval(pip.timer); pip.timer = null; alert('小窓を開けませんでした：' + e.message); }
+}
+function drawPip() {
+  const x = pip.ctx, W = 640, H = 360, lost = !lastFix || Date.now() - lastFix > 5000;
+  const v = lost ? null : liveV, held = !lost && decay != null;
+  x.fillStyle = '#0f1420'; x.fillRect(0, 0, W, H);
+  // 上：GPSの状態と市町村
+  x.textBaseline = 'alphabetic'; x.font = '600 26px system-ui, sans-serif'; x.textAlign = 'left';
+  if (lost) { x.fillStyle = '#ef4444'; x.fillText(lastFix ? `GPS停止中（${Math.round((Date.now() - lastFix) / 1000)}秒）` : 'GPS 測位中…', 24, 44); }
+  else { x.fillStyle = lastAcc <= 15 ? '#34d399' : '#fbbf24'; x.fillText(held ? 'GPSが弱い（直前の速度）' : `精度±${Math.round(lastAcc)}m`, 24, 44); }
+  if (muni.name) { x.textAlign = 'right'; x.fillStyle = '#e6ebf5'; x.fillText(`📍 ${muni.name}`, W - 24, 44); }
+  // 中央：速度（整数は大きく、小数1桁は小さく）
+  const col = v == null || held ? '#8a94a8' : warn === 'fast' ? '#ef4444' : warn === 'slow' ? '#3b82f6' : '#e6ebf5';
+  const [ip, dp] = v == null ? ['--', ''] : v.toFixed(1).split('.');
+  x.textAlign = 'left'; x.fillStyle = col;
+  x.font = '800 190px system-ui, sans-serif';
+  const iw = x.measureText(ip).width;
+  x.font = '800 95px system-ui, sans-serif';
+  const dw = dp ? x.measureText('.' + dp).width : 0;
+  x.font = '600 36px system-ui, sans-serif';
+  const uw = x.measureText('km/h').width;
+  let px = (W - (iw + dw + 12 + uw)) / 2;
+  x.font = '800 190px system-ui, sans-serif'; x.fillText(ip, px, 230); px += iw;
+  if (dp) { x.font = '800 95px system-ui, sans-serif'; x.fillText('.' + dp, px, 230); px += dw; }
+  x.font = '600 36px system-ui, sans-serif'; x.fillStyle = '#8a94a8'; x.fillText('km/h', px + 12, 230);
+  // 設定速度との差
+  x.font = '500 28px system-ui, sans-serif'; x.textAlign = 'center';
+  x.fillText(`設定 ${S.target} ±${S.tol}` + (v == null || held ? '' : `　差 ${v - S.target >= 0 ? '+' : ''}${Math.round(v - S.target)}`), W / 2, 280);
+  // 下：速度バー（中央の白線が設定速度）
+  const bx = 24, bw = W - 48, by = 304, bh = 30, lo = S.target - S.barHalf, span = S.barHalf * 2;
+  const P = s2 => bx + Math.max(0, Math.min(1, (s2 - lo) / span)) * bw;
+  x.fillStyle = '#1c2333'; x.fillRect(bx, by, bw, bh);
+  x.fillStyle = '#ffffff14'; x.fillRect(P(S.target - S.tol), by, P(S.target + S.tol) - P(S.target - S.tol), bh);
+  if (v != null) { const a = P(S.target), b = P(v); x.fillStyle = held ? '#8a94a8' : colorFor(v); x.fillRect(Math.min(a, b), by, Math.abs(b - a), bh); }
+  x.fillStyle = '#fff'; x.fillRect(P(S.target) - 2, by - 4, 4, bh + 8);
+}
+
 // ===================== 起動時の確認 =====================
 // 前回の記録が残っていたら、リセットして新しく始めるか、続きから記録するかを聞く
 function askResetOnStart() {
@@ -1197,6 +1264,7 @@ startRenderLoop();
 applyLayout();
 updateRecBtn();
 try { localStorage.removeItem('drv.imu'); caches.delete('dem-tiles'); } catch {}   // 以前の版のデータを片付け
+pipSetup();
 askResetOnStart();
 // すでに位置情報が許可されていれば、記録前から速度を表示
 navigator.permissions?.query({ name: 'geolocation' }).then(p => { if (p.state === 'granted') startGps(); }).catch(() => {});

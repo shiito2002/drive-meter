@@ -1,7 +1,7 @@
 // オフラインでも起動できるようにアプリ本体をキャッシュする。
 // キャッシュから即表示 → 裏で最新版を取得（次回起動時に反映）。
 // ブラウザのHTTPキャッシュ（GitHub Pagesは最大10分）を通さず、必ずサーバーから取り直す。
-const CACHE = 'drive-meter-v13';
+const CACHE = 'drive-meter-v14';
 const ASSETS = ['./', './index.html', './style.css', './app.js', './manifest.webmanifest',
                 './icons/icon-192.png', './icons/icon-512.png'];
 
