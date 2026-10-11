@@ -1,6 +1,6 @@
 'use strict';
 const $ = id => document.getElementById(id);
-const APP_VERSION = 'v14（2026-10-10）';   // sw.js の CACHE 名と番号をそろえる
+const APP_VERSION = 'v15（2026-10-11）';   // sw.js の CACHE 名と番号をそろえる
 const app = $('app');
 
 // ===================== 設定 =====================

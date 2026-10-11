@@ -154,6 +154,7 @@ dialog::backdrop{background:#000a}
 .set-foot{padding:10px 18px 14px;border-top:1px solid var(--line)}
 .about{margin-top:14px;padding-top:10px;border-top:1px solid var(--line);font-size:13px;color:var(--muted)}
 .about b{color:var(--text)}
+.about a.manual{display:inline-block;margin-top:6px;color:var(--accent);font-weight:700;text-decoration:none}
 .field{padding:10px 0;border-bottom:1px solid var(--line)}
 .field>label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px}
 .field.row{display:flex;align-items:center;justify-content:space-between}
